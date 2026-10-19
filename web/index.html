@@ -318,7 +318,7 @@ async function refreshHealth() {
     if (h.ready) {
       dot.className = "status-dot ok";
       text.textContent =
-        `Milvus ${h.milvus.server_version} · 知识库 ${h.milvus.entities} 个分块`;
+        `Milvus ${h.milvus.server_version} · 知识库 ${h.milvus.chunks} 个分块`;
     } else {
       dot.className = "status-dot down";
       text.textContent = h.error || "服务未就绪";
@@ -339,7 +339,6 @@ async function refreshHealth() {
       { label: "BM25 词法检索", on: true },
       { label: `RRF k=${h.retrieval.rrf_k}`, on: true },
       { label: rrLabel, on: rrEnabled },
-      { label: `融合:${h.retrieval.fusion_mode}`, on: true },
       { label: h.llm.chat_model, on: true },
     ];
     tags.innerHTML = items
@@ -423,7 +422,7 @@ function renderSources(container, sources, meta) {
 
   const head = `<div class="sources-title">
       检索到 ${sources.length} 条上下文
-      · 融合=${escapeHtml(meta.fusion_mode || "-")}
+      · 候选 ${sources.length} 条
     </div>`;
 
   const cards = sources.map((s, i) => {

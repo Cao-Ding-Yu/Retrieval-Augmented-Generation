@@ -1,25 +1,9 @@
 # 本地 RAG 知识库问答系统
 
-> 基于 **Milvus 混合检索（稠密语义 + BM25 词法）+ RRF 倒数排名融合 + 交叉编码器重排 + Ollama 本地大模型** 的检索增强生成服务，配套 FastAPI SSE 流式接口与 Web 聊天界面。**全栈自托管，零外部 API 开销。**
+> Milvus 混合检索（稠密 + BM25）+ RRF 融合 + 交叉编码器重排 + Ollama 本地生成，
+> 配套 FastAPI SSE 流式接口与 Web 聊天界面。**全栈自托管，零外部 API 开销。**
 
-> 想系统性地读懂代码？请看 [LEARNING.md](./LEARNING.md) —— 它给出阅读顺序、数据流转追踪方法与动手实验清单。
-
----
-
-## 目录
-
-- [核心特性](#核心特性)
-- [架构](#架构)
-- [技术栈与版本](#技术栈与版本)
-- [快速开始](#快速开始)
-- [目录结构](#目录结构)
-- [API 接口](#api-接口)
-- [关键设计决策](#关键设计决策)
-- [配置说明](#配置说明)
-- [测试](#测试)
-- [评估](#评估)
-- [故障排查](#故障排查)
-- [后续扩展](#后续扩展)
+整个后端只有 **8 个源文件**，调用链是一条直线 —— 想读懂代码请看 [LEARNING.md](./LEARNING.md)。
 
 ---
 
@@ -27,70 +11,59 @@
 
 | 能力 | 实现要点 |
 |---|---|
-| **混合检索** | 稠密向量（qwen3-embedding:8b）+ 服务端 BM25 全文检索，两路召回互补 |
-| **RRF 融合** | 只用名次、不用分数，规避量纲不可比问题；算法独立成模块并单测 |
-| **交叉编码器重排** | `bge-reranker-v2-m3` 对 top-30 候选精排，显著提升精度 |
-| **重排模型离线加载** | 命中本地缓存时**零网络请求**，规避 HuggingFace etag 校验在国内网络下超时 |
-| **推理模型思考块剥离** | 自动剥离 `deepseek-r1` 等模型的思考过程，且做到**流式跨 chunk 安全** |
-| **可解释检索** | 每条结果携带**各分支原始名次**与命中标记，前端可展开核对 |
-| **流式输出** | SSE 逐 token 推送，首字延迟约 1s，而非等待整段生成 |
+| **混合检索** | 稠密向量（qwen3-embedding:8b）+ 服务端 BM25，两路召回互补 |
+| **RRF 融合** | 只用名次不用分数，规避量纲不可比；纯函数可直接单测 |
+| **交叉编码器重排** | `bge-reranker-v2-m3` 对 top-30 候选精排 |
+| **重排离线加载** | 命中本地缓存时零网络请求，规避 HuggingFace etag 校验超时 |
+| **思考块剥离** | 自动剥离 `deepseek-r1` 的推理过程，且做到流式跨 chunk 安全 |
+| **可解释检索** | 每条结果带"在两条分支各排第几"，前端能标出双分支命中 |
+| **流式输出** | SSE 逐 token 推送 |
 | **幂等入库** | 按 doc_id 先删后插，重复入库不产生重复数据 |
-| **优雅降级** | Milvus 不可用时服务仍启动，`/health` 报告原因，业务接口返回 503 |
-| **版本要求明确** | 直接要求 Milvus 2.5+（服务端 BM25 所需），版本不足时启动即报错而非静默降级 |
-| **可量化评估** | 内置检索指标（命中率/召回/MRR/nDCG，零依赖秒级）+ 可选 RAGAS 生成质量评估 |
-| **驱动层已现代化** | 使用 `MilvusClient` 而非已弃用的 ORM API（`Collection`/`utility` 将在 PyMilvus 3.1 移除） |
+| **优雅降级** | Milvus 不可用时服务仍启动，`/health` 报告原因 |
+| **驱动层已现代化** | 用 `MilvusClient` 而非已弃用的 ORM API（3.1 将移除） |
 
 ---
 
-## 架构
+## 文件职责（按调用顺序）
 
 ```
-                    浏览器（web/index.html）
-                            │ POST /chat + ReadableStream
-                            ▼
-        ┌───────────────────────────────────────────────┐
-        │                 FastAPI 服务                  │
-        │  /chat(SSE)  /chat/sync  /search  /ingest     │
-        │  /stats      /health     /docs                │
-        │                                               │
-        │  检索链路（异步，阻塞调用走线程池）：          │
-        │   1. 查询向量化   (qwen3-embedding:8b)        │
-        │   2. 双分支召回   ┌── 稠密 ANN (COSINE)        │
-        │                   └── BM25 全文检索           │
-        │   3. RRF 融合                                  │
-        │   4. 交叉编码器重排  (bge-reranker-v2-m3)     │
-        │   5. 组装提示词 → 流式生成 → 剥离思考块 → SSE  │
-        └───────────┬───────────────────────┬───────────┘
-                    │                       │
-         ┌──────────▼─────────┐   ┌─────────▼──────────────┐
-         │  Milvus (Docker)   │   │      Ollama (本地)      │
-         │  稠密向量 + BM25    │   │ qwen3-embedding:8b 嵌入 │
-         │  hybrid_search     │   │ deepseek-r1:14b   对话  │
-         └────────────────────┘   └────────────────────────┘
+                     ┌──────────────────────────────────────┐
+  浏览器 ──POST───►  │ api.py                               │
+                     │  /chat(SSE) /chat/sync /search        │
+                     │  /ingest /stats /health              │
+                     └───────────────┬──────────────────────┘
+                                     │ rag.aretrieve() / rag.astream()
+                     ┌───────────────▼──────────────────────┐
+                     │ rag.py     ← 全项目的主流程           │
+                     │  1. embed_query                       │
+                     │  2. store.dense_search / sparse_search│
+                     │  3. store.fuse (RRF)                  │
+                     │  4. _rerank (交叉编码器)              │
+                     │  5. llm.astream → ThinkingStripper    │
+                     └───────────────┬──────────────────────┘
+                                     │
+                     ┌───────────────▼──────────────────────┐
+                     │ store.py   Milvus 唯一入口            │
+                     │  建表 / 写入 / 两路检索 / RRF 融合     │
+                     └──────────────────────────────────────┘
+
+  旁路：ingest.py  文件 → 分块 → 向量 → store.insert
+        config.py  所有配置 + 日志
+        main.py    启动入口        cli.py  命令行
 ```
 
----
-
-## 技术栈与版本
-
-版本号均为 2026-10 实测的最新稳定版，已在 `pyproject.toml` 中显式锁定。
-
-| 组件 | 版本 | 说明 |
+| 文件 | 职责 | 约行数 |
 |---|---|---|
-| Python | 3.11 / 3.12 | LangChain 1.x 要求 ≥3.10 |
-| `langchain` | 1.4.5 | **1.x 版本线**，集成已拆分为独立包 |
-| `langchain-ollama` | 1.1.0 | `ChatOllama` / `OllamaEmbeddings` |
-| `langchain-milvus` | 0.4.0 | Milvus 向量库封装 |
-| `langchain-text-splitters` | 1.1.3 | 递归文本切分 |
-| `sentence-transformers` | 6.1.0 | `CrossEncoder` 重排 |
-| `pymilvus` | 3.0.x | 兼容 Milvus 2.4+ 服务端 |
-| Milvus | **2.5.x LTS（硬性要求）** | 词法分支依赖服务端 BM25 `Function`，该能力自 2.5 起提供 |
-| Ollama | v0.40.4 | Windows 安装包 `OllamaSetup.exe` |
-| FastAPI | ≥0.115 | Async + SSE |
+| `config.py` | 配置（`Settings`）与日志设置 | 120 |
+| `store.py` | Milvus：建表、写入、稠密/BM25 检索、RRF 融合 | 330 |
+| `ingest.py` | 文件加载 → 切分 → 向量化 → 写入 | 240 |
+| `rag.py` | 检索编排、重排、提示词、流式生成、思考块剥离 | 400 |
+| `api.py` | FastAPI 应用与所有路由、SSE 编码 | 290 |
+| `main.py` | uvicorn 启动 | 40 |
+| `cli.py` | 命令行：入库 / 检索 / 概况 | 170 |
 
-> **注意**：LangChain 已进入 1.x，`langchain.embeddings`、`langchain.vectorstores`
-> 等旧路径**已不存在**。本项目使用模块化包（`langchain-ollama` / `langchain-milvus`）。
-> 不要参考 2024 年之前的教程。
+依赖关系只有单向一层：`api → rag → store`。没有依赖注入容器、
+没有跨模块回调、没有为"将来可能复用"而预先拆分的层。
 
 ---
 
@@ -99,442 +72,121 @@
 ### 1. 前置条件
 
 ```powershell
-# Ollama：拉取模型
 ollama pull qwen3-embedding:8b    # 嵌入模型，输出 4096 维
-ollama pull deepseek-r1:14b       # 对话模型（推理模型）
-ollama list                       # 确认两个模型都在
+ollama pull deepseek-r1:14b       # 对话模型
+ollama list
 
-# Milvus：已有实例则跳过；否则用自带编排文件起一个
-docker compose -f docker/milvus-compose.yml up -d
+# Milvus 需 >= 2.5（词法分支依赖服务端 BM25 Function）
+# 用 Docker 自行部署一个实例即可（etcd + minio + milvus 三件套），
+# 默认 gRPC 端口 19530，与 .env 里的 MILVUS_URI 对应。
 ```
 
-### 2. 安装
+### 2. 安装与配置
 
 ```powershell
-# 创建并激活虚拟环境
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
-
-# 安装项目（含开发依赖）
 pip install -e ".[dev]"
 ```
 
-### 3. 配置
+配置全部在 `.env` 里（已被 gitignore）。所有项都有代码默认值，不填也能跑。
 
-复制 `.env` 模板后按本机情况修改。**所有配置项都有代码默认值，不填也能跑**；
-`.env` 已被 `.gitignore` 忽略，不会进入版本库。
-
-关键几项（完整说明见 [配置说明](#配置说明)）：
-
-```ini
-CHAT_MODEL=deepseek-r1:14b
-EMBEDDING_MODEL=qwen3-embedding:8b
-EMBEDDING_DIM=4096                                  # 必须与模型真实输出一致
-MILVUS_COLLECTION=rag_chunks_qwen3_4096              # 建议把模型与维度编进集合名
-RERANKER_MODEL=BAAI/bge-reranker-v2-m3
-RERANKER_OFFLINE_FIRST=true                          # 命中本地缓存则不联网
-```
-
-> **关于重排模型**：首次使用需要一次下载（约 2GB），之后会走本地缓存。
-> `RERANKER_OFFLINE_FIRST=true` 会让加载优先只读本地缓存 ——
-> HuggingFace 默认每次都会向远端校验 etag，在国内网络下经常超时数秒甚至失败。
-> 缓存缺失时会自动联网下载一次（由 `RERANKER_ALLOW_DOWNLOAD` 控制），
-> 因此纯内网环境若已备好缓存，可把该项设为 `false` 彻底禁止联网。
-
-### 4. 建库
+### 3. 建库
 
 ```powershell
-# 把语料放进 data/ 目录，然后执行批量入库
 rag-app-cli ingest ./data
-
-# 查看知识库规模与当前生效的检索配置
 rag-app-cli stats
 ```
 
-若 `rag-app-cli` 命令不可用（未做 editable 安装），改用模块方式：
-
-```powershell
-$env:PYTHONPATH="src"; python -m rag_app.cli stats
-```
-
-### 5. 启动服务
+### 4. 启动
 
 ```powershell
 rag-app
-# 或：python -m rag_app.main
+# 打开 http://127.0.0.1:8000/
 ```
 
-打开 **http://127.0.0.1:8000/** 使用聊天界面。
-
-### 6. 验证检索效果（推荐先做这一步）
+### 5. 先验证检索（推荐）
 
 ```powershell
-# 命令行观察打分明细：能看出每条结果来自语义命中还是关键词命中
-rag-app-cli search "RRF 是怎么工作的"
+rag-app-cli search "你的问题"
 ```
 
-> 若这里的结果就不相关，**先不要怀疑 LLM**。
-> 检索错了，模型再强也救不回来 —— 先调 `CHUNK_SIZE` 与 `TOP_K`。
+会打印每条结果的**命中分支**（如 `稠密#2 + 稀疏#1`）与分数。
+如果这里就不相关，先别怀疑模型 —— 调 `CHUNK_SIZE` / `TOP_K`。
 
 ---
 
-## 目录结构
-
-```
-.
-├─ .env                          本地配置（已被 gitignore，含本机地址与模型名）
-├─ pyproject.toml                依赖与工具配置
-├─ README.md                     本文档
-├─ LEARNING.md                   学习路线：如何读懂这个项目
-├─ docker/milvus-compose.yml     Milvus standalone 编排（兜底方案）
-├─ src/rag_app/
-│  ├─ config.py                  pydantic-settings 配置
-│  ├─ models.py                  RetrievedChunk / IngestReport
-│  ├─ schema.py                  Milvus 结构 + BM25 Function + 版本探测
-│  ├─ deps.py                    依赖组装（composition root）
-│  ├─ logging_setup.py           日志与弃用警告降噪
-│  ├─ cli.py                     命令行工具
-│  ├─ main.py                    uvicorn 入口
-│  ├─ ingest/
-│  │  ├─ loader.py               PDF/TXT/MD 解析，稳定 doc_id
-│  │  ├─ splitter.py             中文友好的递归切分
-│  │  └─ service.py              加载→切分→向量化→写入
-│  ├─ retrieval/
-│  │  ├─ milvus_store.py         ★ 集合管理 + RRF 融合 + 两条检索路径
-│  │  ├─ rerank.py               ★ 交叉编码器重排（离线优先加载）
-│  │  └─ hybrid.py               ★ 检索编排
-│  ├─ llm/
-│  │  ├─ prompts.py              提示词构造（约束/引用/兜底）
-│  │  └─ chat.py                 流式对话 + 思考块剥离
-│  ├─ eval/                      评估：检索指标（零依赖）+ 可选 RAGAS
-│  │  ├─ retrieval_metrics.py    ★ 命中率/召回/MRR/nDCG（纯函数，可单测）
-│  │  ├─ dataset.py              金标准 JSONL 读写与校验
-│  │  ├─ runner.py               把评估集跑过真实链路
-│  │  └─ ragas_eval.py           RAGAS 集成（惰性导入，可选依赖）
-│  └─ api/
-│     ├─ app.py                  应用装配 + lifespan
-│     ├─ routes_chat.py          /chat /chat/sync /search
-│     ├─ routes_ingest.py        /ingest /ingest/upload /stats
-│     └─ sse.py                  SSE 帧编码
-├─ tests/                        单元测试（默认不依赖外部服务）
-└─ web/index.html                零构建流式聊天界面
-```
-
----
-
-## API 接口
+## API
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/chat` | **流式对话（SSE）**，主接口 |
-| POST | `/chat/sync` | 非流式对话，便于脚本与测试 |
-| POST | `/search` | **纯检索**，返回完整打分明细，排查问题用 |
-| POST | `/ingest` | 按服务端路径入库 |
+| POST | `/chat` | **流式对话（SSE）** |
+| POST | `/chat/sync` | 非流式，便于脚本 |
+| POST | `/search` | **纯检索**，排查问题时先看这个 |
+| POST | `/ingest` | 按路径入库 |
 | POST | `/ingest/upload` | 上传文件入库 |
-| GET | `/stats` | 知识库规模与检索配置 |
+| GET | `/stats` | 知识库规模与配置 |
 | GET | `/health` | 健康检查（含降级原因） |
-| GET | `/docs` | OpenAPI 交互文档 |
+| GET | `/docs` | OpenAPI 文档 |
 
-### SSE 事件协议
-
-```
-event: sources     # 检索结果，先发，让前端立刻渲染引用
-data: {"count":5,"fusion_mode":"server","bm25_mode":"server","sources":[...]}
-
-event: token       # 文本增量，可能多次（思考块已被剥离）
-data: {"text":"混合检索"}
-
-event: done        # 正常结束
-data: {"answer_chars":312}
-
-event: error       # 出错（响应头已发出，只能靠事件通知）
-data: {"message":"服务端处理失败：RuntimeError"}
-```
-
-**流式调用示例：**
+SSE 事件序列：`sources`（引用列表）→ `token`（文本增量，多次）→ `done`。
+出错时发 `error` —— 此时响应头已发出，只能靠事件类型告知前端。
 
 ```powershell
 curl.exe -N -X POST http://127.0.0.1:8000/chat `
-  -H "Content-Type: application/json" `
-  -d "{\"message\":\"RRF 是怎么工作的\"}"
+  -H "Content-Type: application/json" -d "{\"message\":\"RRF 是什么\"}"
 ```
-
-> 前端用 `fetch` + `ReadableStream` 而非 `EventSource`，因为 `EventSource`
-> 只支持 GET 且无法传请求体，长问题会被 URL 长度限制截断。
 
 ---
 
-## 关键设计决策
-
-### 1. 为什么用混合检索，而不是只用稠密向量？
-
-稠密检索（语义相似）擅长同义改写，但**漏精确标识符** —— 错误码、函数名、版本号、人名，
-这些在向量空间里与上下文高度纠缠，很容易被"语义相近但无关"的内容挤掉。
-BM25（词法）恰好相反：精确词命中极强，但不认识同义词。
-
-两者是**互补**而非替代关系，所以两路都跑，再融合。
-
-### 2. 为什么用 RRF 而不做分数加权？
-
-稠密输出余弦相似度（-1~1），BM25 输出无上界的词频加权分。两者量纲完全不同，
-加权前必须归一化，而归一化对分数分布尾部极其敏感，是不稳定的经验操作。
-
-RRF 只用**名次**：
-
-```
-RRF(d) = Σ_r 1 / (k + rank_r(d))
-```
-
-无需求解分数校准问题，且"两个分支都排第二"恒优于"单个分支排第一"
-（数学上 `2/(k+2) > 1/(k+1)` 对所有 `k>0` 成立）——
-这正是"多路证据一致性比单路极端高分更可信"的形式化表达。
-
-算法在 `retrieval/milvus_store.py` 里独立实现了一份（`reciprocal_rank_fusion`），
-而不是只依赖 Milvus 的内置 `RRFRanker`。原因是独立实现才能被单测覆盖、
-才能拿到各分支的原始名次用于向用户解释排序 —— 而不是"相信数据库算对了"。
-
-### 3. 为什么还要加交叉编码器重排？
-
-双编码器（稠密检索）为了能建索引，必须把查询和文档**分别**编码 ——
-编码文档时根本不知道查询是什么，两者没有交互。
-
-交叉编码器把 `(查询, 文档)` 拼成一个序列一起送进模型，注意力可直接在两者间交互，
-相关性判断准确得多。代价是无法预计算，N 个候选要跑 N 次前向。
-
-所以标准做法是两阶段：
-
-```
-第一阶段 召回：百万级 → top-20~30    （求"不漏"）
-第二阶段 精排：只对这几十条逐对打分    （求"排准"）
-```
-
-### 4. 融合策略可配置：自己融合，还是交给 Milvus
-
-两种都支持，`FUSION_MODE` 决定用哪个：
-
-| 取值 | 做法 | 往返 | 分支名次 | 适用 |
-|---|---|---|---|---|
-| `client` | 稠密 / BM25 各检索一次，用本地 RRF 融合 | 2 次 | **有** | 需要解释排序、调试检索质量 |
-| `server` | 一次 `hybrid_search`，交给 Milvus 内置 `RRFRanker` | 1 次 | 无 | QPS 压力大，可接受"黑盒排序" |
-
-**两者算出的排序是一致的** —— Milvus 的 `RRFRanker` 用的就是同一个 RRF 公式。
-区别只在"谁来做融合"和"是否保留中间信息"。
-
-选 `client` 的额外收益：每个结果都带"在稠密分支排第几、在 BM25 分支排第几"，
-前端据此标出**双分支命中**（既语义相关、又命中关键词）的高质量结果。
-这也是 `RetrievedChunk` 里 `dense_rank` / `sparse_rank` / `rrf_score` 三个字段的用途 ——
-它们不是冗余，而是"可解释检索"的实现。
-
-### 5. 为什么直接要求 Milvus 2.5+，而不兼容 2.4？
-
-Milvus 2.4 也能做混合检索，但稀疏向量必须由**客户端**用 BM25EmbeddingFunction
-编码后写入，带来三个额外负担：
-
-- 编码前要先在语料上拟合 IDF 统计量，且拟合结果必须持久化
-  （否则进程重启后新旧向量不在同一尺度，检索结果失真）；
-- 多一个分词语言配置项，中文语料配错就等于词法分支失效；
-- 检索侧要区分"传稀疏向量"还是"传原始文本"两套逻辑。
-
-2.5 的服务端 BM25 `Function` 把这些问题一次解决。既然目标环境就是 2.5+，
-继续保留 2.4 回退路径只会让代码更难读，因此明确**不兼容并在启动时给出清晰报错**。
-
-**为什么不静默降级**：版本不足时词法分支会整个失效，检索退化成纯向量检索。
-这种"能跑但效果差"的状态极难排查 —— 用户只会觉得"答案不相关"，
-却看不出根因。宁可启动就报错。
-
-### 6. 为什么要处理"阻塞调用"？
-
-Ollama 客户端与 pymilvus 都是**同步阻塞**的。若直接在 `async` 函数里调用，
-会占住事件循环 —— 表现是"SSE 流式输出期间其他请求全部卡住"，
-即"看起来异步、实际串行"。
-
-本项目把所有阻塞调用统一包进 `asyncio.to_thread`，让它们在线程池中执行。
-
-### 7. 为什么思考块剥离必须做成状态机？
-
-`deepseek-r1` 这类推理模型会把推理链包在思考标签之间混在正文里输出。
-直接流式转发的话，用户会先看到一大段"让我想想…"，界面像坏了；
-更麻烦的是思考里的 `[1]` 会被前端误当成引用标记。
-
-**不能用简单的正则替换**：流式的 token 边界与标签边界无关，
-结束标签可能被切成"前半截"+"后半截"两次到达。
-对单个 chunk 直接做正则，会漏掉被切断的标签，导致标签碎片泄漏到界面上。
-
-因此 `llm/chat.py` 的 `ThinkingStripper` 是一个小状态机：
-只输出确定安全的部分，把可能构成"半个标签"的尾巴留在缓冲区等下一个 chunk。
-
----
-
-## 配置说明
-
-全部配置见 `.env`。以下按重要性分组。
-
-### 影响检索质量
-
-| 参数 | 当前值 | 调大后 | 调小后 |
-|---|---|---|---|
-| `CHUNK_SIZE` | 800 | 上下文更完整，但语义被稀释、噪声多 | 命中更精准，但单块信息可能不足 |
-| `DENSE_TOP_K` / `SPARSE_TOP_K` | 20 | 召回更全，但融合候选变多 | 更快，但可能漏掉正确结果 |
-| `RRF_K` | 60 | 结果更平均，弱化单路头部 | 更倚重单路的头部结果 |
-| `RERANK_TOP_N` | 30 | 精排更充分，**但延迟线性增长** | 更快，但好结果可能没进精排 |
-| `FINAL_TOP_K` | 5 | 上下文更全，但可能引入噪声、拖慢生成 | 更聚焦，但可能信息不足 |
-| `BM25_ANALYZER_TYPE` | 空 | — | 中文语料应设为 `chinese`，否则词法召回基本失效 |
-
-**调参建议顺序**：先固定 `RERANK_ENABLED=false` 调召回（`CHUNK_SIZE` / `TOP_K`），
-召回满意后再打开重排调 `RERANK_TOP_N` / `FINAL_TOP_K`。
-
-> 消融对比很容易做：改 `RERANK_ENABLED` 后重启，用同一批问题对比
-> `/search` 返回的排序差异 —— 这也是写进简历的量化素材。
-
-> ⚠️ `BM25_ANALYZER_TYPE` **只在建集合时生效**。改动它必须更换
-> `MILVUS_COLLECTION` 并重新入库，否则配置改了也不起作用。
-
-### 重排模型加载
+## 配置要点
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `HF_HOME` | 空 | HF 缓存根目录。空 = 默认位置（Windows: `C:/Users/<用户>/.cache/huggingface`） |
-| `RERANKER_OFFLINE_FIRST` | `true` | 优先只读本地缓存，避免每次启动联网校验 etag |
-| `RERANKER_ALLOW_DOWNLOAD` | `true` | 缓存缺失时允许联网下载一次；纯内网可设 `false` 彻底禁止 |
-
-### 生成
-
-| 参数 | 默认 | 说明 |
-|---|---|---|
-| `TEMPERATURE` | 0.2 | 采样温度 |
-| `MAX_CONTEXT_CHARS` | 6000 | 拼进提示词的上下文长度上限，防止拖慢推理 |
-| `STRIP_THINKING` | `true` | 剥离推理模型的思考块 |
-
-### 模型与集合
-
-| 参数 | 说明 |
-|---|---|
-| `CHAT_MODEL` | 对话模型。推理模型也可用，思考块会自动剥离 |
-| `EMBEDDING_MODEL` / `EMBEDDING_DIM` | 二者必须匹配，否则写库报维度错误 |
-| `MILVUS_COLLECTION` | 建议把嵌入模型与维度编进名字，换模型时自动落到新集合 |
-
-**已核对的嵌入维度对照**：`qwen3-embedding:8b` → 4096；`bge-m3` → 1024；
-`nomic-embed-text` → 768。
+| `CHUNK_SIZE` / `CHUNK_OVERLAP` | 800 / 120 | 分块大小；检索质量的天花板 |
+| `DENSE_TOP_K` / `SPARSE_TOP_K` | 20 / 20 | 两个分支各召回多少条 |
+| `RRF_K` | 60 | 融合常数：越大越平均，越小越看重头部 |
+| `RERANK_TOP_N` | 30 | 送去重排的候选数（逐对前向，不能太多） |
+| `FINAL_TOP_K` | 5 | 最终交给模型的上下文条数 |
+| `BM25_ANALYZER_TYPE` | 空 | **中文语料请设 `chinese`**，否则词法分支基本失效（仅建集合时生效） |
+| `RERANKER_OFFLINE_FIRST` | true | 优先读本地缓存，避免每次启动联网校验 |
+| `STRIP_THINKING` | true | 剥离推理模型的思考过程 |
+| `EMBEDDING_DIM` | 4096 | 必须与嵌入模型一致，否则写库报错 |
 
 ---
 
 ## 测试
 
 ```powershell
-# 单元测试（默认，不需要 Milvus/Ollama，全部使用测试替身）
-pytest
-
-# 含真实模型/真实 Milvus 的集成测试（会下载模型，较慢）
-pytest -m integration
-
-# 覆盖率
-pytest --cov=rag_app --cov-report=term-missing
-
-# 代码风格
+pytest            # 62 个测试，不需要 Milvus / Ollama / 任何模型
 ruff check .
 ```
 
-测试组织：
-
 | 文件 | 覆盖内容 |
 |---|---|
-| `test_rrf.py` | **RRF 打分公式、双分支优势、k 作用方向、确定性、边界** |
-| `test_retrieval.py` | 两条融合路径、名次回填、重排顺序、各类截断阈值、能力修正逻辑 |
-| `test_rerank.py` | 排序正确性、**返回原始下标而非位置**、同分稳定性、空输入 |
-| `test_rerank_cache.py` | **本地快照目录解析**：refs 优先于最新、refs 失效时降级、边界与大小写 |
-| `test_prompts.py` | 编号连续性、上下文截断、禁止先验知识、兜底出口 |
-| `test_chat.py` | **思考块剥离的状态机、跨 chunk 标签切分、标签纯 ASCII 守卫** |
-| `test_eval.py` | **检索指标（命中/召回/MRR/nDCG）、金标准加载的各类畸形输入** |
-| `test_api.py` | **SSE 帧格式与事件顺序**、响应头、503 降级、上传路径净化 |
+| `test_store.py` | **RRF 融合**：打分公式、双分支优势、去重、k 的影响、确定性 |
+| `test_rag.py` | **提示词拼接**、上下文截断、**思考块剥离的流式状态机** |
+| `test_api.py` | **SSE 帧格式与事件顺序**、503 降级、检索为空走兜底 |
 
-单元测试全部使用测试替身，因此**不需要 Milvus、Ollama 或下载任何模型**即可运行。
+全部使用测试替身，因此跑得快、离线可跑、结果稳定。
 
 ---
 
 ## 故障排查
 
-| 现象 | 原因 | 处理 |
-|---|---|---|
-| `/health` 显示 `degraded` | Milvus 未连上或版本过低 | 看 `error` 字段；确认 19530 端口、`MILVUS_URI` 与 Milvus 版本 ≥ 2.5 |
-| **启动报"Milvus 版本过低"** | 服务端 < 2.5，无 BM25 Function | 升级服务端；可用 `docker/milvus-compose.yml` 起一个 2.5+ 实例 |
-| 检索结果为空 | 还没入库 | `rag-app-cli stats` 看 `entities`；先跑 `ingest` |
-| 检索结果不相关 | 分块过大 / `TOP_K` 太小 / 缺中文分析器 | 调 `CHUNK_SIZE`；用 `/search` 看命中分支；考虑 `BM25_ANALYZER_TYPE=chinese` |
-| 答案像在编造 | 提示词约束被绕过，或检索没命中 | 看引用卡片；若没引用说明检索为空 |
-| **每次启动都联网、很慢** | 重排模型在做 etag 校验 | 确认 `RERANKER_OFFLINE_FIRST=true`；`/health` 的 `reranker.loaded_offline` 应为 `true` |
-| **报 "couldn't find them in the cached files" 但缓存里明明有** | HF 的**仓库解析**环节失败，不是文件缺失 | 本项目会先自己定位 `snapshots/<commit>/` 并以本地目录加载，正常应绕过该问题；若仍失败，看日志里的完整堆栈与 `HF 环境变量` 那行 |
-| **模型已在缓存却报找不到** | HF 缓存路径不对 | 查 `/health` 的 `reranker.resolved_path` 与日志中的 `hub 缓存=`；缓存布局为 `<缓存根>/models--<作者>--<模型名>/snapshots/<commit>/` |
-| **回答里出现大段思考内容** | 思考块未被剥离 | 确认 `STRIP_THINKING=true`；若模型用了非标准标签需扩展 `ThinkingStripper` |
-| **前端顶部出现黄色告警条** | 服务降级（如重排加载失败） | 告警条里就是具体原因；修好后重启服务即可恢复 |
-| 流式不生效（一次性返回） | 反向代理缓冲 | 已设置 `X-Accel-Buffering: no`；自建 Nginx 需加 `proxy_buffering off` |
-| 中文被切成乱码 | 流式解码未处理跨 chunk 多字节字符 | 前端已用 `TextDecoder({stream:true})`；自研客户端需注意 |
-| 首次请求特别慢 | 重排模型冷启动 | 已在 lifespan 中 `warmup()`；若仍慢检查是否走了 `reload=True` |
-| 换嵌入模型后报维度不匹配 | 集合维度与模型不符 | 修改 `MILVUS_COLLECTION` 换新集合名（**不要**让代码自动删库） |
-
----
-
-## 评估
-
-评估分两层，按"速度 / 依赖"切分。这个划分是刻意的：**绝大多数调参影响的是检索，
-而检索指标的反馈速度快两个数量级** —— 先让检索可量化，再去追生成质量。
-
-### 第一层：检索指标（秒级，零额外依赖）
-
-```powershell
-# 准备评估集：复制示例并改成你自己语料的真实文件名
-copy data/golden_qa.example.jsonl data/golden_qa.jsonl
-
-rag-app-cli eval data/golden_qa.jsonl
-```
-
-输出四个指标 + **未命中样本清单**（最该看的部分）：
-
-| 指标 | 看什么 |
+| 现象 | 处理 |
 |---|---|
-| `命中率@k` | top-k 里有没有找到 |
-| `召回@k` | 该找的是否找全了 |
-| `MRR@k` | 第一个命中排得靠不靠前（重排做得好不好） |
-| `nDCG@k` | 整体排序质量 |
-
-四个要一起看：命中率高但 MRR 低 → 找到了但排在后面（重排没生效）；
-命中率低 → 召回本身有问题。
-
-**这是做消融实验的主力工具**：改 `CHUNK_SIZE` / `RRF_K` / `RERANK_ENABLED`
-各跑一次，`summary_line()` 能直接横向对比。
-
-### 第二层：RAGAS 生成质量（分钟级，可选依赖）
-
-```powershell
-pip install -e ".[eval]"
-
-# 先用 1 条验证 API 与裁判模型是否可用 —— 别一上来就全量
-rag-app-cli eval data/golden_qa.jsonl --ragas --limit 1
-
-rag-app-cli eval data/golden_qa.jsonl --ragas --metrics faithfulness,context_precision
-```
-
-**关于本地模型当裁判的现实问题**：RAGAS 的 LLM 评判指标要求裁判模型稳定输出
-结构化 JSON，7B~14B 的本地模型经常做不到，表现为大量样本返回 `NaN`。
-建议顺序：先只开 `faithfulness`（要求最低）试水，稳定后再加其它指标。
-
-> RAGAS 的 API 在 0.2/0.3/0.4 之间变动过多次，本项目的调用集中在
-> `eval/ragas_eval.py` 一个文件里并按多个候选类名容错，版本不匹配时只需改这一处。
-> 由于开发环境未安装 ragas，**该集成未经本机实测** —— 首次使用请务必带 `--limit 1`。
-
----
-
-## 后续扩展
-
-以下两项刻意**不在核心范围内**，但都是低成本高收益的增量：
-
-- **LangSmith 可观测性** —— LangChain 1.x 原生支持回调，接入后可看到每次检索的
-  完整链路（召回、融合、重排分数、生成耗时）。
-- **CI/CD** —— GitHub Actions 跑 `ruff` + `pytest`，构建前端与 API 镜像。
-
-其他可选方向：查询改写（多查询召回后再融合）、父子分块（小块检索、大块送上下文）、
-对话历史的指代消解、多租户集合隔离、测试集自动生成（RAGAS 的 testset generation）。
+| 启动报"Milvus 版本过低" | 服务端需 >= 2.5（BM25 Function）；升级或用 Docker 起一个 2.5+ 实例 |
+| `/health` 显示 degraded | 看 `error` 字段；确认 19530 端口与 `.env` 里的地址 |
+| **前端顶部出现黄色告警条** | 那里就是降级原因（如重排加载失败），修好后重启即可 |
+| **每次启动都联网、很慢** | 确认 `RERANKER_OFFLINE_FIRST=true` |
+| 报 "couldn't find them in the cached files" 但缓存里有 | 项目会先自己定位 `snapshots/<commit>/` 并以本地目录加载；看启动日志里的完整堆栈 |
+| 检索结果不相关 | 先调 `CHUNK_SIZE`；用 `rag-app-cli search` 看命中分支；考虑设中文分析器 |
+| 回答里出现大段思考内容 | 确认 `STRIP_THINKING=true` |
+| 换嵌入模型后报维度不匹配 | 改 `MILVUS_COLLECTION` 换新集合名（不要自动删库） |
 
 ---
 
 ## 许可
 
-本项目为个人作品集项目，供学习与演示使用。
+个人作品集项目，供学习与演示使用。
