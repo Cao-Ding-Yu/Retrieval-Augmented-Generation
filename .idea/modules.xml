@@ -2,7 +2,7 @@
 <project version="4">
   <component name="ProjectModuleManager">
     <modules>
-      <module fileurl="file://$PROJECT_DIR$/.idea/Retrieval-Augmented Generation.iml" filepath="$PROJECT_DIR$/.idea/Retrieval-Augmented Generation.iml" />
+      <module fileurl="file://$PROJECT_DIR$/.idea/RAG-app.iml" filepath="$PROJECT_DIR$/.idea/RAG-app.iml" />
     </modules>
   </component>
 </project>
