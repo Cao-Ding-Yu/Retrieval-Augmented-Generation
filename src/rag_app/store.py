@@ -42,11 +42,12 @@ FIELD_TEXT = "text"
 FIELD_DOC_ID = "doc_id"
 FIELD_SOURCE = "source"
 FIELD_CHUNK_INDEX = "chunk_index"
+FIELD_PAGE = "page"
 FIELD_DENSE = "dense"
 FIELD_SPARSE = "sparse"
 
 # 检索时要取回的标量字段
-OUTPUT_FIELDS = [FIELD_TEXT, FIELD_DOC_ID, FIELD_SOURCE, FIELD_CHUNK_INDEX]
+OUTPUT_FIELDS = [FIELD_TEXT, FIELD_DOC_ID, FIELD_SOURCE, FIELD_CHUNK_INDEX, FIELD_PAGE]
 
 # 服务端 BM25 自 Milvus 2.5 起提供
 MIN_SERVER_VERSION = (2, 5)
@@ -70,6 +71,13 @@ class Hit:
     chunk_index: int
     score: float
     """当前生效的分数。融合后是 RRF 分数；重排后会被替换成重排分数。"""
+
+    page: int | None = None
+    """PDF 页码（1 起）。非 PDF 来源为 None。
+
+    ``chunk_index`` 是"该文件内的第几个分块"，与 PDF 页码不是一回事：
+    一页可能被切成多个分块，且分块序号跨页连续。所以引用定位要单独存页码。
+    """
 
     dense_rank: int | None = None
     """在稠密分支中的名次（0 起）。未命中该分支为 None。"""
@@ -95,6 +103,7 @@ class Hit:
             "doc_id": self.doc_id,
             "source": self.source,
             "chunk_index": self.chunk_index,
+            "page": self.page,
             "score": round(self.score, 6),
             "score_kind": self.score_kind,
             "dense_rank": self.dense_rank,
@@ -227,6 +236,7 @@ class MilvusStore:
 
         if client.has_collection(name):
             self._check_dimension(name)
+            self._ensure_page_field(name)   # 老集合可能没有 page 字段，补上
             client.load_collection(name)  # Milvus 重启后需重新 load 才能检索
             logger.info("复用已存在的集合：%s", name)
             return
@@ -246,6 +256,9 @@ class MilvusStore:
         schema.add_field(FIELD_DOC_ID, DataType.VARCHAR, max_length=64)
         schema.add_field(FIELD_SOURCE, DataType.VARCHAR, max_length=512)
         schema.add_field(FIELD_CHUNK_INDEX, DataType.INT64)
+        # 页码：非 PDF 来源写 0。声明为 nullable —— 与服务端对
+        # add_collection_field 的约束保持一致，两条创建路径产出的 schema 才相同。
+        schema.add_field(FIELD_PAGE, DataType.INT64, nullable=True)
         schema.add_field(FIELD_DENSE, DataType.FLOAT_VECTOR, dim=dim)
         schema.add_field(FIELD_SPARSE, DataType.SPARSE_FLOAT_VECTOR)
 
@@ -300,11 +313,45 @@ class MilvusStore:
             return
         raise RuntimeError(f"集合 {name} 里没有 {FIELD_DENSE} 字段，可能不是本项目创建的")
 
+    def _ensure_page_field(self, name: str) -> None:
+        """给没有 ``page`` 字段的老集合补上该字段。
+
+        为什么要做这件事：``page`` 是后加的能力（引用里显示 PDF 页码）。
+        已经存在的集合没有这个字段，而写入时带未知字段会直接报错。
+
+        Note:
+            服务端对 ``add_collection_field`` 有硬约束：**新增字段必须 nullable**
+            （不接受只给 default_value）。所以这里声明 ``nullable=True``，
+            存量行读出 None —— 读侧把空值当作"没有页码"。
+
+            补完字段只解决"写入不再报错"；存量数据要**重新入库**才会有真实页码。
+        """
+        info = self.client.describe_collection(name)
+        existing = {f.get("name") for f in info.get("fields", [])}
+        if FIELD_PAGE in existing:
+            return
+
+        logger.warning("集合 %s 缺少 %s 字段，正在补加（存量数据需重新入库才有页码）",
+                       name, FIELD_PAGE)
+        # 加字段前必须 release，否则服务端会拒绝结构变更
+        try:
+            self.client.release_collection(name)
+        except Exception:  # pragma: no cover - 未 load 时 release 会报错，忽略即可
+            logger.debug("release 集合失败（可能本就未加载）", exc_info=True)
+
+        self.client.add_collection_field(
+            collection_name=name,
+            field_name=FIELD_PAGE,
+            data_type=DataType.INT64,
+            nullable=True,
+        )
+        logger.info("已为集合 %s 补加 %s 字段", name, FIELD_PAGE)
+
     # ------------------------------------------------------------------
     # 写入
     # ------------------------------------------------------------------
     def insert(self, rows: list[dict]) -> int:
-        """写入分块。每行需含 text/doc_id/source/chunk_index/dense。
+        """写入分块。每行需含 text/doc_id/source/chunk_index/dense，可选 page。
 
         **不要**传 sparse —— 它由服务端 BM25 Function 自动生成。
         这里做一次剔除，免得调用方踩坑。
@@ -318,6 +365,8 @@ class MilvusStore:
         payload = [dict(row) for row in rows]
         for row in payload:
             row.pop(FIELD_SPARSE, None)
+            # page 缺省补 0（非 PDF 来源），保证字段齐全
+            row[FIELD_PAGE] = int(row.get(FIELD_PAGE) or 0)
 
         result = self.client.insert(self._settings.milvus_collection, data=payload)
         inserted = int(result.get("insert_count", len(payload)))
@@ -350,12 +399,28 @@ class MilvusStore:
         return int(result.get("deleted_count", len(ids)))
 
     def count(self) -> int:
-        """集合中的分块总数（健康检查 / 入库后校验用）。"""
+        """集合中**实际可检索**的分块数。
+
+        ## 为什么不用 get_collection_stats().row_count
+
+        那个数字是物理行数，**包含已删除但尚未 compaction 的行**。
+        入库是"先删后插"，所以重新入库之后它不降反升 ——
+        实测从 371 变成 742，看起来像数据翻倍，其实是旧行的墓碑还没被清理。
+
+        ``count(*)`` 走查询路径，只统计未删除的行，才是用户真正能检索到的数量。
+        """
+        name = self._settings.milvus_collection
         try:
-            return int(self.client.get_collection_stats(
-                self._settings.milvus_collection).get("row_count", -1))
-        except Exception:  # pragma: no cover
-            return -1
+            rows = self.client.query(
+                name, filter="", output_fields=["count(*)"], consistency_level="Strong"
+            )
+            return int(rows[0].get("count(*)", -1)) if rows else 0
+        except Exception:  # pragma: no cover - 聚合查询不可用时退回统计接口
+            logger.warning("count(*) 查询失败，退回 get_collection_stats", exc_info=True)
+            try:
+                return int(self.client.get_collection_stats(name).get("row_count", -1))
+            except Exception:
+                return -1
 
     # ------------------------------------------------------------------
     # 检索
@@ -443,6 +508,8 @@ def _to_hits(results) -> list[Hit]:
     hits: list[Hit] = []
     for row in results[0]:
         entity = row.get("entity") or {}
+        # 页码用 0 表示"非 PDF"（见 _ensure_page_field），对外转成 None
+        page = int(entity.get(FIELD_PAGE, 0) or 0)
         hits.append(
             Hit(
                 id=str(row.get("id")),
@@ -451,6 +518,7 @@ def _to_hits(results) -> list[Hit]:
                 source=str(entity.get(FIELD_SOURCE, "") or ""),
                 chunk_index=int(entity.get(FIELD_CHUNK_INDEX, -1) or -1),
                 score=float(row.get("distance", 0.0)),
+                page=page if page > 0 else None,
             )
         )
     return hits

@@ -234,7 +234,9 @@ def format_context(hits: list[Hit], max_chars: int) -> str:
     used = 0
     for index, hit in enumerate(hits, start=1):
         name = hit.source.replace("\\", "/").rsplit("/", 1)[-1]
-        block = f"[{index}] 来源: {name} · 第 {hit.chunk_index + 1} 块\n{hit.text.strip()}"
+        # PDF 标页码（模型可以据此在答案里写"第几页"），其它标分块序号
+        where = f"第 {hit.page} 页" if hit.page else f"第 {hit.chunk_index + 1} 块"
+        block = f"[{index}] 来源: {name} · {where}\n{hit.text.strip()}"
 
         if used + len(block) + 2 > max_chars:
             if not blocks:  # 第一条就超长，截断保留开头

@@ -113,6 +113,7 @@ async def _ingest_one(store: MilvusStore, embedder, doc_id: str, chunks: list[Do
             "doc_id": str(chunk.metadata.get("doc_id", doc_id)), # 文档id
             "source": str(chunk.metadata.get("source", "")), # 文档路径
             "chunk_index": int(chunk.metadata.get("chunk_index", -1)), # 切块索引
+            "page": int(chunk.metadata.get("page") or 0), # 切块所属页码
             "dense": vector, # 文本向量
         } for chunk, vector in zip(chunks, vectors, strict=True)
     ]
@@ -214,7 +215,8 @@ def _load_pdf(file: Path, doc_id: str) -> list[Document]:
                     page_content=text,
                     metadata={
                         "doc_id": doc_id,
-                        "source": str(file)
+                        "source": str(file),
+                        "page": page_number,
                     }
                 )
             )

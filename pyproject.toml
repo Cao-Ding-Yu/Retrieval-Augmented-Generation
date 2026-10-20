@@ -67,3 +67,6 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+# E701：本文件作者偏好紧凑的单行写法（`if x: continue`、`try: stmt`），
+# 该规则会与之持续冲突。只影响排版，不影响正确性，故关闭。
+ignore = ["E701"]

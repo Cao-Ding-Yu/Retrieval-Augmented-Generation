@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from rag_app.store import fuse
+from rag_app.store import _to_hits, fuse
 from tests.conftest import make_hit
 
 
@@ -118,3 +118,57 @@ class TestEdgeCases:
     def test_non_positive_k_raises(self):
         with pytest.raises(ValueError, match="必须为正数"):
             fuse([make_hit("a")], [], k=0)
+
+
+class TestPagePropagation:
+    """PDF 页码要从 Milvus 行一路传到前端 payload。
+
+    页码和 chunk_index 是两个概念：一页可能切出多块，分块序号还跨页连续。
+    所以引用"第 10 页"不能拿 chunk_index+1 冒充。
+    """
+
+    def test_hit_page_defaults_to_none(self):
+        assert make_hit("a").page is None
+
+    def test_to_dict_exposes_page(self):
+        hit = make_hit("a")
+        hit.page = 7
+
+        assert hit.to_dict()["page"] == 7
+
+    def test_to_hits_reads_page(self):
+        rows = [[{"id": 1, "distance": 0.5, "entity": {
+            "text": "t", "doc_id": "d", "source": "s.pdf",
+            "chunk_index": 2, "page": 7,
+        }}]]
+
+        hit = _to_hits(rows)[0]
+
+        assert hit.page == 7
+        assert hit.chunk_index == 2
+
+    def test_zero_page_means_not_a_pdf(self):
+        """写入时非 PDF 来源写 0，读出来必须还原成 None。"""
+        rows = [[{"id": 1, "distance": 0.5, "entity": {
+            "text": "t", "doc_id": "d", "source": "a.txt",
+            "chunk_index": 0, "page": 0,
+        }}]]
+
+        assert _to_hits(rows)[0].page is None
+
+    def test_missing_page_field_tolerated(self):
+        """老集合补字段前写入的行没有该字段，不能因此报错。"""
+        rows = [[{"id": 1, "distance": 0.5, "entity": {
+            "text": "t", "doc_id": "d", "source": "a.txt", "chunk_index": 0,
+        }}]]
+
+        assert _to_hits(rows)[0].page is None
+
+    def test_null_page_tolerated(self):
+        """补字段后存量行读出 None（服务端要求新增字段 nullable）。"""
+        rows = [[{"id": 1, "distance": 0.5, "entity": {
+            "text": "t", "doc_id": "d", "source": "a.txt",
+            "chunk_index": 0, "page": None,
+        }}]]
+
+        assert _to_hits(rows)[0].page is None

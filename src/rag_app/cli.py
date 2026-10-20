@@ -96,7 +96,8 @@ async def _cmd_search(rag: RAG, args: argparse.Namespace) -> int:
         if hit.sparse_rank is not None:
             branches.append(f"稀疏#{hit.sparse_rank + 1}")
 
-        print(f"[{rank}] {hit.source}  第 {hit.chunk_index + 1} 块")
+        where = f"第 {hit.page} 页" if hit.page else f"第 {hit.chunk_index + 1} 块"
+        print(f"[{rank}] {hit.source}  {where}")
         print(f"    命中分支: {' + '.join(branches) or '-'}   分数: {hit.score:.4f}")
         if hit.is_hybrid_hit:
             print("    ★ 语义与关键词同时命中")

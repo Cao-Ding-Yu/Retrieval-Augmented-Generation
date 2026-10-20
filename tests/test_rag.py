@@ -77,6 +77,25 @@ class TestFormatContext:
         assert text
         assert len(text) < 5000
 
+    def test_pdf_hit_labelled_with_page_number(self):
+        """PDF 要标页码，而不是分块序号 —— 用户是按页找原文的。"""
+        hit = make_hit("a", text="正文")
+        hit.page = 7
+        hit.chunk_index = 42
+
+        text = format_context([hit], max_chars=1000)
+
+        assert "第 7 页" in text
+        assert "第 43 块" not in text
+
+    def test_non_pdf_hit_falls_back_to_chunk_index(self):
+        hit = make_hit("a", text="正文", chunk_index=4)
+
+        text = format_context([hit], max_chars=1000)
+
+        assert "第 5 块" in text
+        assert "页" not in text
+
 
 class TestBuildMessages:
     def test_returns_system_and_human(self):

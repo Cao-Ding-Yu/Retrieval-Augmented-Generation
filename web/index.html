@@ -576,12 +576,18 @@ function renderSources(container, sources) {
     if (hasDenseRank) rankParts.push(`稠密#${s.dense_rank + 1}`);
     if (hasSparseRank) rankParts.push(`稀疏#${s.sparse_rank + 1}`);
 
+    // 定位信息：PDF 显示页码（用户真正关心的），其它格式显示第几个分块。
+    // chunk_index 是"该文件内第几块"，和 PDF 页码不是一回事。
+    const locator = (s.page !== null && s.page !== undefined)
+      ? `第 ${s.page} 页`
+      : `第 ${(s.chunk_index ?? 0) + 1} 块`;
+
     return `
       <div class="source" data-idx="${i}">
         <div class="src-head">
           <span class="src-idx">[${i + 1}]</span>
           <span class="src-name">${escapeHtml(s.source || "未知来源")}</span>
-          <span class="src-meta">第 ${(s.chunk_index ?? 0) + 1} 块</span>
+          <span class="src-meta">${escapeHtml(locator)}</span>
           <span class="badge ${badgeClass}">${badgeText}</span>
           ${scoreText ? `<span class="src-meta">${escapeHtml(scoreText)}</span>` : ""}
           ${rankParts.length ? `<span class="src-meta">${escapeHtml(rankParts.join(" · "))}</span>` : ""}
