@@ -62,7 +62,6 @@ class SearchRequest(BaseModel):
 
 class IngestPathRequest(BaseModel):
     path: str = Field(..., min_length=1)
-    recursive: bool = True
 
 
 # ===========================================================================
@@ -241,15 +240,17 @@ def _register_routes(app: FastAPI) -> None:
     # ---------------------------------------------------------------- 入库
     @app.post("/ingest", tags=["ingest"])
     async def ingest_path(payload: IngestPathRequest, request: Request) -> dict:
-        """把服务端某个路径导入知识库。同一文件重复入库是幂等的。"""
+        """把服务端某个路径导入知识库。目录会递归处理。
+
+        同一文件重复入库是幂等的（按 doc_id 先删后插）。
+        """
         rag = get_rag(request)
 
         target = Path(payload.path)
         if not target.exists():
             raise HTTPException(status.HTTP_404_NOT_FOUND, f"路径不存在：{payload.path}")
 
-        report = await ingest(rag.settings, rag.store, rag.embedder,
-                              target, payload.recursive)
+        report = await ingest(rag.settings, rag.store, rag.embedder, target)
         return report.to_dict()
 
     @app.post("/ingest/upload", tags=["ingest"])
@@ -272,8 +273,7 @@ def _register_routes(app: FastAPI) -> None:
         target.write_bytes(content)
         logger.info("已保存上传文件：%s", target)
 
-        report = await ingest(rag.settings, rag.store, rag.embedder,
-                              target, recursive=False)
+        report = await ingest(rag.settings, rag.store, rag.embedder, target)
         return report.to_dict()
 
     # ---------------------------------------------------------------- 概况

@@ -62,9 +62,10 @@ async def _cmd_ingest(rag: RAG, args: argparse.Namespace) -> int:
     print(f"开始入库：{target.resolve()}")
     print(f"  切分参数：chunk_size={rag.settings.chunk_size}, "
           f"overlap={rag.settings.chunk_overlap}")
+    if target.is_dir():
+        print("  目录会递归处理所有子目录")
 
-    report = await ingest(rag.settings, rag.store, rag.embedder,
-                          target, recursive=not args.no_recursive)
+    report = await ingest(rag.settings, rag.store, rag.embedder, target)
 
     print("\n入库完成：")
     print(f"  成功文档 : {report.files_loaded}")
@@ -142,9 +143,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_ingest = sub.add_parser("ingest", help="把文件或目录导入知识库")
+    p_ingest = sub.add_parser(
+        "ingest", help="把文件或目录导入知识库（目录递归处理）"
+    )
     p_ingest.add_argument("path", help="文件或目录路径")
-    p_ingest.add_argument("--no-recursive", action="store_true", help="不递归子目录")
 
     p_search = sub.add_parser("search", help="执行检索并查看打分明细")
     p_search.add_argument("query", help="查询文本")
