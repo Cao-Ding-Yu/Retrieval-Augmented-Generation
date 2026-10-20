@@ -69,22 +69,29 @@ class FakeRAG:
         settings: Settings,
         hits=None,
         deltas=None,
+        thinking=None,
         rerank_enabled: bool = True,
         warning: str | None = None,
+        device: str | None = "cpu",
     ) -> None:
         self.settings = settings
         self.store = self._Store()
         self.rerank_enabled = rerank_enabled
         self.rerank_warning = warning
+        self.rerank_device = device
         self._hits = hits if hits is not None else []
         self._deltas = deltas if deltas is not None else ["你好", "，", "世界"]
+        self._thinking = thinking if thinking is not None else []
 
     async def aretrieve(self, question: str):
         return list(self._hits)
 
     async def astream(self, question: str, hits):
+        # 与 RAG.astream 一致：产出 (类型, 文本) 二元组
+        for text in self._thinking:
+            yield "thinking", text
         for delta in self._deltas:
-            yield delta
+            yield "answer", delta
 
     async def answer(self, question: str, hits) -> str:
         return "".join(self._deltas)

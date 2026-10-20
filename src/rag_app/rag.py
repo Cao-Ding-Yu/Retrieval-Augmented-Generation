@@ -53,25 +53,30 @@ class RAG:
             model=settings.embedding_model,
         )
         # 对话模型：用于生成答案
+        #
+        # reasoning=True 不是"让模型开始思考"，而是让**库把思考内容交出来**：
+        # langchain_ollama 默认（reasoning=None）不会把 Ollama 返回的
+        # message.thinking 写进 additional_kwargs，思考会被它直接丢弃 ——
+        # 表现为"模型明明思考了，但界面上完全看不到"，而且没有任何报错。
+        # 只有需要展示时才打开，避免给不支持思考的模型传这个参数。
         self.llm = ChatOllama(
             base_url=settings.ollama_base_url,
             model=settings.chat_model,
             temperature=settings.temperature,
+            reasoning=settings.show_thinking,
         )
 
         self._reranker: _Reranker | None = None
         self.rerank_warning: str | None = None
         """重排加载失败时的原因，会显示在健康检查与前端告警条里"""
+        self.rerank_device: str | None = None
+        """重排实际使用的设备（cpu / cuda / mps），加载成功后才有值"""
 
     # ------------------------------------------------------------------
     # 启动 / 关闭
     # ------------------------------------------------------------------
     def start(self) -> None:
-        """连接 Milvus 并加载重排模型。由应用的 lifespan 调用一次。
-
-        Milvus 连不上会抛异常（检索是整个服务的基础，无法降级）；
-        重排加载失败只降级为不重排，并把原因记到 ``rerank_warning``。
-        """
+        """连接 Milvus 并加载重排模型"""
         _apply_hf_env(self.settings)
         self.store.connect()
 
@@ -82,11 +87,12 @@ class RAG:
         try:
             self._reranker = _Reranker(self.settings)
             self._reranker.load()
+            self.rerank_device = self._reranker.device
         except Exception as exc:
-            # 不阻断服务：降级为不重排，但把原因暴露出来（不静默）
             self.rerank_warning = f"重排模型加载失败，已降级为不重排：{type(exc).__name__}: {exc}"
             logger.exception("重排模型加载失败")
             self._reranker = None
+            self.rerank_device = None
 
     def close(self) -> None:
         self.store.close()
@@ -96,20 +102,18 @@ class RAG:
         return self._reranker is not None
 
     # ------------------------------------------------------------------
-    # 检索（检索 + 重排，不调用生成模型）
+    # 检索 + 重排
     # ------------------------------------------------------------------
     async def aretrieve(self, question: str) -> list[Hit]:
-        """检索入口。同步链路放到线程池，避免阻塞事件循环。"""
+        """检索入口"""
         return await asyncio.to_thread(self.retrieve, question)
 
     def retrieve(self, question: str) -> list[Hit]:
-        """完整检索：向量化 → 双分支召回 → RRF 融合 → 交叉编码器重排。
-
-        这是全项目最核心的方法，从上到下就是检索的全部逻辑。
+        """
+        完整检索：向量化 → 双分支召回 → RRF 融合 → 交叉编码器重排
         """
         question = (question or "").strip()
-        if not question:
-            return []
+        if not question: return list()
 
         # 1) 查询向量化
         vector = self.embedder.embed_query(question)
@@ -120,32 +124,26 @@ class RAG:
 
         # 3) 按名次融合（RRF）
         candidates = fuse(dense, sparse, k=self.settings.rrf_k)
-        if not candidates:
-            return []
+        if not candidates: return list()
 
-        # 4) 截断到重排预算：重排是逐对前向计算，候选太多会很慢
+        # 4) 截断到重排预算
         candidates = candidates[: self.settings.rerank_top_n]
 
         # 5) 精排后取最终条数
         return self._rerank(question, candidates)
 
     def _rerank(self, question: str, hits: list[Hit]) -> list[Hit]:
-        """用交叉编码器重排，返回前 final_top_k 条。
-
-        未启用重排时原样截断 —— 调用方不需要关心重排是否可用。
-        """
+        """用交叉编码器重排，返回前 final_top_k 条"""
         limit = self.settings.final_top_k
-        if self._reranker is None:
-            return hits[:limit]
+        if self._reranker is None: return hits[:limit]
 
         scores = self._reranker.score(question, [h.text for h in hits])
         # 按重排分数降序；分数相同时保持原顺序，保证结果可复现
         order = sorted(range(len(hits)), key=lambda i: (-scores[i], i))
-        result = []
+        result = list()
         for index in order[:limit]:
             hit = hits[index]
             hit.score = scores[index]
-            # 标记分数来源，前端据此显示"重排"而不是"RRF"
             hit.score_kind = "rerank"
             result.append(hit)
         return result
@@ -153,33 +151,59 @@ class RAG:
     # ------------------------------------------------------------------
     # 生成
     # ------------------------------------------------------------------
-    async def astream(self, question: str, hits: list[Hit]) -> AsyncIterator[str]:
-        """流式生成答案，逐段产出文本。
+    async def astream(
+        self, question: str, hits: list[Hit]
+    ) -> AsyncIterator[tuple[str, str]]:
+        """流式生成答案，逐段产出 ``(类型, 文本)``。
 
-        推理模型（deepseek-r1 等）会把思考过程混在正文里，
-        这里边流边剥离，用户只会看到最终答案。
+        推理模型（deepseek-r1 等）会产生思考内容，这里始终把它和答案**拆开**：
+          * ``("answer", 文本)``   —— 最终答案；
+          * ``("thinking", 文本)`` —— 思考过程。
+
+        拆分与"是否展示"是两件事：思考内容无论如何都不能混进答案，
+        但要不要给用户看由 ``SHOW_THINKING`` 决定（见 ``settings.show_thinking``）。
+
+        ## 思考内容有两个来源，都要处理
+
+        1. **独立字段** ``additional_kwargs["reasoning_content"]`` ——
+           新版 Ollama 对支持思考的模型（如 ``deepseek-r1``）把思考放在
+           ``message.thinking`` 里，``content`` 在思考阶段是空的。
+           ``langchain_ollama`` 会把它转存到 ``reasoning_content``。
+        2. **正文里的标签** ``<think>…</think>`` ——
+           老版本 Ollama 或其它推理模型会直接混在 ``content`` 里。
+
+        只处理其中一种都会漏：只认标签时，字段型思考会被**静默丢弃**
+        （界面上"看不到思考过程"且没有任何报错）。
         """
         messages = build_messages(question, hits, self.settings.max_context_chars)
-        stripper = ThinkingStripper(enabled=self.settings.strip_thinking)
+        stripper = ThinkingStripper()
+        show = self.settings.show_thinking
 
         async for chunk in self.llm.astream(messages):
-            text = _chunk_text(chunk.content)
-            if not text:
-                continue
-            safe = stripper.feed(text)
-            if safe:
-                yield safe
+            # 来源 1：独立字段
+            field_thinking = str(chunk.additional_kwargs.get("reasoning_content") or "")
 
-        tail = stripper.flush()
-        if tail:
-            yield tail
+            # 来源 2：正文标签
+            raw = _chunk_text(chunk.content)
+            answer, tag_thinking = stripper.feed(raw) if raw else ("", "")
+
+            thinking = field_thinking + tag_thinking
+            if thinking and show:
+                yield "thinking", thinking
+            if answer:
+                yield "answer", answer
+
+        answer, tag_thinking = stripper.flush()
+        if tag_thinking and show:
+            yield "thinking", tag_thinking
+        if answer:
+            yield "answer", answer
 
     async def answer(self, question: str, hits: list[Hit]) -> str:
         """一次性生成完整答案（脚本与测试用；面向用户应走 SSE）。"""
         messages = build_messages(question, hits, self.settings.max_context_chars)
         response = await self.llm.ainvoke(messages)
-        return strip_thinking(_chunk_text(response.content),
-                              enabled=self.settings.strip_thinking)
+        return strip_thinking(_chunk_text(response.content))
 
 
 # ===========================================================================
@@ -245,20 +269,24 @@ class _Reranker:
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._model: Any = None
+        self.device = "cpu"
+        """实际加载到的设备，供 /health 展示"""
 
     def load(self) -> None:
         """
         加载模型
 
         三级加载顺序：
-          1. 按 HF 缓存定位，跳过仓库解析与 etag 校验；
-          2. 按仓库名加载但带 ``local_files_only=True``；
+          1. 按 HF 缓存定位，跳过仓库解析与 etag 校验
+          2. 按仓库名加载但带 ``local_files_only=True``
           3. 联网下载
         """
         from sentence_transformers import CrossEncoder
 
         name = self._settings.reranker_model
-        kwargs = {"device": "cpu", "max_length": 512}
+        self.device = resolve_device(self._settings.reranker_device)
+        logger.info("重排模型将加载到设备：%s", self.device)
+        kwargs = {"device": self.device, "max_length": 512}
 
         if self._settings.reranker_offline_first:
             snapshot = _resolve_snapshot_dir(name)
@@ -266,66 +294,110 @@ class _Reranker:
                 try:
                     logger.info("从本地快照加载重排模型：%s", snapshot)
                     self._model = CrossEncoder(str(snapshot), **kwargs)
-                    logger.info("重排模型已加载（无网络请求）")
+                    logger.info("重排模型已加载")
                     return
                 except Exception:
                     logger.warning("本地快照加载失败，改试离线模式", exc_info=True)
             try:
                 self._model = CrossEncoder(name, local_files_only=True, **kwargs)
-                logger.info("重排模型已加载（无网络请求）")
+                logger.info("重排模型已加载")
                 return
             except Exception:
-                if not self._settings.reranker_allow_download:
-                    raise
-                logger.warning("本地缓存不可用，联网下载重排模型 %s（仅此一次）", name)
+                if not self._settings.reranker_allow_download: raise
+                logger.warning("本地缓存不可用，联网下载重排模型 %s", name)
 
         self._model = CrossEncoder(name, local_files_only=False, **kwargs)
         logger.info("重排模型已加载（经由网络/默认路径）")
 
     def score(self, question: str, documents: list[str]) -> list[float]:
-        """给每个候选打相关性分数（越大越相关）。"""
-        if not documents:
-            return []
+        """给候选文档打相关性分数"""
+        if not documents: return list()
         pairs = [(question, doc) for doc in documents]
         return [float(s) for s in self._model.predict(pairs, batch_size=16, show_progress_bar=False)]
 
 
-def _apply_hf_env(settings: Settings) -> None:
-    """在任何 HF 相关 import 之前把缓存位置写进环境变量。
+def resolve_device(preference: str) -> str:
+    """把 ``RERANKER_DEVICE`` 解析成实际可用的设备名。
 
-    ``huggingface_hub`` 在 **import 时**就读取 HF_HOME 并算出缓存路径常量，
-    之后再改环境变量就不生效了（表现为"配了却没用"）。所以必须最早执行。
+    ``auto`` 的优先级：CUDA → Apple MPS → CPU。
+
+    ## 为什么不能只看 torch.cuda.is_available()
+
+    装了**纯 CPU 版** torch 时（版本号带 ``+cpu``），``torch.cuda`` 模块存在
+    但 ``is_available()`` 恒为 False —— 哪怕机器上有能用的 NVIDIA 显卡。
+    这种情况下必须换 CUDA 版的 torch 轮子，改配置是没用的。
+    所以这里显式检查，并在用户**手写** cuda 但不可用时抛出可读的错误，
+    而不是悄悄退回 CPU 让人以为在用 GPU。
+
+    Args:
+        preference: ``auto`` / ``cpu`` / ``cuda`` / ``mps``。
+
+    Returns:
+        可直接传给 sentence-transformers 的设备字符串。
+
+    Raises:
+        RuntimeError: 显式指定了不可用的设备。
     """
-    if settings.hf_home:
-        os.environ["HF_HOME"] = str(Path(settings.hf_home).expanduser())
+    preference = (preference or "auto").strip().lower()
+
+    try:
+        import torch
+    except Exception:  # pragma: no cover - 没装 torch 时不该拦住建库
+        if preference == "auto":
+            return "cpu"
+        raise
+
+    def has_cuda() -> bool:
+        return bool(torch.cuda.is_available())
+
+    def has_mps() -> bool:
+        backend = getattr(torch.backends, "mps", None)
+        return bool(backend and backend.is_available())
+
+    if preference == "auto":
+        if has_cuda():
+            return "cuda"
+        if has_mps():
+            return "mps"
+        return "cpu"
+
+    if preference == "cuda" and not has_cuda():
+        raise RuntimeError(
+            f"RERANKER_DEVICE=cuda，但当前 torch 无法使用 CUDA（版本 {torch.__version__}）。\n"
+            "原因：装的是纯 CPU 版 torch，或驱动/CUDA 版本不匹配。\n"
+            "处理：改装 CUDA 版 torch（见 README 的『用 GPU 跑重排』一节），"
+            "或把 RERANKER_DEVICE 改成 auto/cpu。"
+        )
+    if preference == "mps" and not has_mps():
+        raise RuntimeError("RERANKER_DEVICE=mps，但当前环境不支持 Apple MPS。")
+
+    return preference
+
+
+def _apply_hf_env(settings: Settings) -> None:
+    """在 HF 相关 import 之前把缓存位置写进环境变量"""
+    if settings.hf_home: os.environ["HF_HOME"] = str(Path(settings.hf_home).expanduser())
 
 
 def _resolve_snapshot_dir(model_name: str) -> Path | None:
-    """把 ``作者/模型名`` 解析成 HF 缓存里的快照目录。
+    """
+    把目标模型解析向 HF 缓存里的快照目录
 
     缓存布局::
-
         <hub>/models--<作者>--<模型名>/
             refs/main           # 内容为 commit 哈希
             snapshots/<commit>/ # 真正的模型文件
-
-    以本地目录加载时 HuggingFace 会当作"本地模型"，完全跳过仓库解析与网络校验。
     """
-    if "/" not in model_name:
-        return None
-
+    if "/" not in model_name: return None
     try:
         from huggingface_hub.constants import HF_HUB_CACHE
-
         root = Path(HF_HUB_CACHE)
-    except Exception:  # pragma: no cover
-        return None
+    except Exception: return None
 
     org, _, name = model_name.partition("/")
     repo = root / f"models--{org}--{name}"
     snapshots = repo / "snapshots"
-    if not snapshots.is_dir():
-        return None
+    if not snapshots.is_dir(): return None
 
     ref = repo / "refs" / "main"
     if ref.is_file():
@@ -367,61 +439,58 @@ class ThinkingStripper:
     OPEN_TAG = chr(60) + "think" + chr(62)
     CLOSE_TAG = chr(60) + "/think" + chr(62)
 
-    def __init__(self, enabled: bool = True) -> None:
-        self._enabled = enabled
+    def __init__(self) -> None:
         self._buffer = ""       # 尚未确定能否输出的尾部
         self._inside = False    # 当前是否在思考块内
 
-    def feed(self, text: str) -> str:
-        """送入一段增量，返回可以安全输出的部分。"""
-        if not self._enabled:
-            return text
+    def feed(self, text: str) -> tuple[str, str]:
+        """送入一段增量，返回 ``(正文, 思考)`` 两部分的增量。
 
+        两者互斥：一段文本要么属于正文，要么属于思考块。
+        返回空串表示这一段没有对应内容。
+        """
         self._buffer += text
-        out: list[str] = []
+        answer: list[str] = []
+        thinking: list[str] = []
 
         while True:
-            if self._inside:
-                index = self._buffer.find(self.CLOSE_TAG)
-                if index == -1:
-                    self._buffer = _keep_tail(self._buffer, self.CLOSE_TAG)
-                    return "".join(out)
-                self._buffer = self._buffer[index + len(self.CLOSE_TAG):]
-                self._inside = False
-            else:
-                index = self._buffer.find(self.OPEN_TAG)
-                if index == -1:
-                    keep = len(self.OPEN_TAG) - 1
-                    if len(self._buffer) > keep:
-                        out.append(self._buffer[: len(self._buffer) - keep])
-                        self._buffer = self._buffer[len(self._buffer) - keep:]
-                    return "".join(out)
-                out.append(self._buffer[:index])
-                self._buffer = self._buffer[index + len(self.OPEN_TAG):]
-                self._inside = True
+            tag = self.CLOSE_TAG if self._inside else self.OPEN_TAG
+            sink = thinking if self._inside else answer
+            index = self._buffer.find(tag)
 
-    def flush(self) -> str:
-        """流结束时调用，返回剩余可输出内容（未闭合的思考块直接丢弃）。"""
-        if not self._enabled:
-            return ""
-        remainder = "" if self._inside else self._buffer
+            if index == -1:
+                # 找不到完整标签：可以安全输出到"可能构成半个标签"的位置之前
+                keep = len(tag) - 1
+                if len(self._buffer) > keep:
+                    sink.append(self._buffer[: len(self._buffer) - keep])
+                    self._buffer = self._buffer[len(self._buffer) - keep:]
+                break
+
+            sink.append(self._buffer[:index])
+            self._buffer = self._buffer[index + len(tag):]
+            self._inside = not self._inside
+
+        return "".join(answer), "".join(thinking)
+
+    def flush(self) -> tuple[str, str]:
+        """流结束时调用，返回剩余内容 ``(正文, 思考)``。
+
+        未闭合的思考块（模型被截断）仍归入思考部分 —— 它是推理过程，
+        不能混进答案，但拿来展示是合适的。
+        """
+        answer = "" if self._inside else self._buffer
+        thinking = self._buffer if self._inside else ""
         self._buffer = ""
         self._inside = False
-        return remainder
+        return answer, thinking
 
 
-def strip_thinking(text: str, enabled: bool = True) -> str:
-    """一次性剥离完整文本里的思考块（非流式场景）。"""
-    if not enabled:
-        return text
+def strip_thinking(text: str) -> str:
+    """一次性剥离完整文本里的思考块，只返回正文（非流式场景）。"""
     stripper = ThinkingStripper()
-    return stripper.feed(text) + stripper.flush()
-
-
-def _keep_tail(text: str, tag: str) -> str:
-    """保留末尾可能与标签前缀重合的部分（长度 len(tag)-1）。"""
-    keep = len(tag) - 1
-    return text[-keep:] if keep > 0 else ""
+    answer, _thinking = stripper.feed(text)
+    tail, _ = stripper.flush()
+    return answer + tail
 
 
 def _chunk_text(content: Any) -> str:

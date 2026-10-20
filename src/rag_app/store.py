@@ -22,12 +22,10 @@ import logging
 from dataclasses import dataclass, replace
 
 from pymilvus import (
-    AnnSearchRequest,
     DataType,
     Function,
     FunctionType,
     MilvusClient,
-    RRFRanker,
 )
 
 from rag_app.config import Settings
@@ -452,35 +450,6 @@ class MilvusStore:
             data=[query_text],
             anns_field=FIELD_SPARSE,
             search_params={"metric_type": "BM25", "params": {}},
-            limit=limit,
-            output_fields=OUTPUT_FIELDS,
-        )
-        return _to_hits(results)
-
-    def hybrid_search(self, vector: list[float], query_text: str, limit: int,
-                      rrf_k: int) -> list[Hit]:
-        """一次调用交给 Milvus 做混合检索（服务端 RRF，单次往返）。
-
-        比"两次检索 + 本地 fuse"少一次网络往返，但拿不到各分支名次。
-        注意 MilvusClient 的参数名是 ``ranker``（不是 ORM 的 ``rerank``），
-        且 BM25 分支同样用 ``AnnSearchRequest`` —— pymilvus 里**没有**
-        ``BM25SearchRequest`` 这个类。
-        """
-        results = self.client.hybrid_search(
-            collection_name=self._settings.milvus_collection,
-            reqs=[
-                AnnSearchRequest(
-                    data=[vector], anns_field=FIELD_DENSE,
-                    param={"metric_type": "COSINE",
-                           "params": {"ef": max(HNSW_SEARCH_EF, limit)}},
-                    limit=limit,
-                ),
-                AnnSearchRequest(
-                    data=[query_text], anns_field=FIELD_SPARSE,
-                    param={"metric_type": "BM25"}, limit=limit,
-                ),
-            ],
-            ranker=RRFRanker(k=rrf_k),
             limit=limit,
             output_fields=OUTPUT_FIELDS,
         )

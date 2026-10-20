@@ -162,14 +162,32 @@ def _register_routes(app: FastAPI) -> None:
             "reranker": {
                 "enabled": bool(rag and rag.rerank_enabled),
                 "model": cfg.reranker_model,
+                # 实际加载到的设备。configured 是配置值，device 是真实结果 ——
+                # 两者不一致（例如配了 cuda 却回退 cpu）时能一眼看出来。
+                "device": rag.rerank_device if rag else None,
+                "device_configured": cfg.reranker_device,
             },
-            "llm": {"chat_model": cfg.chat_model},
+            "llm": {
+                "chat_model": cfg.chat_model,
+                "show_thinking": cfg.show_thinking,
+            },
         })
 
     # ---------------------------------------------------------------- 对话（SSE）
     @app.post("/chat", tags=["chat"])
     async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
-        """流式对话：先推引用，再逐 token 推答案。"""
+        """流式对话：先推引用，再推思考（可选），最后逐 token 推答案。
+
+        事件序列::
+
+            sources  -> 引用列表
+            thinking -> 思考过程增量（仅 SHOW_THINKING=true 时发送，可多次）
+            token    -> 答案增量（多次）
+            done     -> 结束
+
+        思考与答案用**不同事件**而不是拼在一起：前端可以把思考渲染成
+        独立、可折叠的区块，答案区保持干净（思考里的 ``[1]`` 不会被误当引用）。
+        """
         rag = get_rag(request)
 
         async def stream() -> AsyncIterator[str]:
@@ -191,13 +209,16 @@ def _register_routes(app: FastAPI) -> None:
 
                 # 3) 流式生成
                 total = 0
-                async for delta in rag.astream(payload.message, hits):
+                async for kind, delta in rag.astream(payload.message, hits):
                     # 客户端断开就停止，避免白跑几分钟推理
                     if await request.is_disconnected():
                         logger.info("客户端已断开，终止生成")
                         return
-                    total += len(delta)
-                    yield _sse("token", {"text": delta})
+                    if kind == "thinking":
+                        yield _sse("thinking", {"text": delta})
+                    else:
+                        total += len(delta)
+                        yield _sse("token", {"text": delta})
 
                 yield _sse("done", {"answer_chars": total})
 

@@ -45,6 +45,26 @@
     font-size: 14px; line-height: 1.65;
   }
 
+  /* ==================== 滚动条 ====================
+     浏览器默认滚动条在深色背景上是一条亮白色长条，非常突兀。
+     这里统一改成暗色：Firefox 用标准属性，Chrome/Edge/Safari 用伪元素。
+     两边都写是因为标准属性在较老的 Chromium 上不生效。 */
+  * {
+    scrollbar-width: thin;                      /* Firefox */
+    scrollbar-color: #333a4a transparent;
+  }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb {
+    background: #333a4a;
+    border-radius: 6px;
+    /* 用透明边框 + content-box 让滑块看起来更细，不贴着轨道边缘 */
+    border: 2px solid transparent;
+    background-clip: content-box;
+  }
+  ::-webkit-scrollbar-thumb:hover { background: #454e63; background-clip: content-box; }
+  ::-webkit-scrollbar-corner { background: transparent; }
+
   /* ==================== 布局 ==================== */
   /* 100dvh 作为 100vh 的补充：移动端浏览器地址栏伸缩会让 100vh 溢出，
      导致底部输入框被裁掉。不支持的浏览器会忽略第二行、沿用 100vh。 */
@@ -130,6 +150,34 @@
   .bubble pre code { background: none; padding: 0; }
   .bubble ul, .bubble ol { padding-left: 22px; }
   .bubble a { color: var(--accent); }
+
+  /* 思考过程：与答案并列但视觉上明显弱化。
+     用独立区块而不是把思考拼进答案，是为了让引用标记 "[1]" 只出现在答案里。 */
+  .thinking {
+    margin-bottom: 12px; padding: 8px 12px;
+    border-left: 3px solid #3a4152;
+    background: #171a22; border-radius: 0 6px 6px 0;
+    color: var(--text-faint); font-size: 12.5px; line-height: 1.6;
+    white-space: pre-wrap; overflow-wrap: anywhere;
+    max-height: 260px; overflow-y: auto;
+  }
+  .thinking::before {
+    content: "思考过程"; display: block; margin-bottom: 4px;
+    font-size: 10.5px; letter-spacing: .08em; text-transform: uppercase;
+    color: #5d6577;
+  }
+  .thinking:empty { display: none; }
+
+  /* 答案生成完毕后收起：流式期间展开是为了看到推理进展，
+     答案出来后再占版面就没意义了。收成一行入口，想看还能点开。 */
+  .thinking.collapsed { display: none; }
+  .thinking-toggle {
+    margin-bottom: 10px; padding: 0;
+    background: none; border: none;
+    color: var(--text-faint); font-size: 11.5px;
+    cursor: pointer; letter-spacing: .04em;
+  }
+  .thinking-toggle:hover { color: var(--text-dim); }
 
   /* 光标：生成过程中显示，让"正在输出"有明确视觉反馈 */
   .cursor {
@@ -428,8 +476,8 @@ jumpBtn.addEventListener("click", () => {
 
 /**
  * 拉取 /health 并渲染状态标签。
- * 这里展示 bm25_mode / fusion_mode / rerank 的**真实**取值，
- * 而不是写死文案——降级发生时界面上能直接看出来。
+ * 标签一律取自后端返回的**真实**取值（模型名、RRF k、重排设备），
+ * 而不是写死文案 —— 降级发生时界面上能直接看出来。
  */
 async function refreshHealth() {
   const dot = $("statusDot");
@@ -455,9 +503,9 @@ async function refreshHealth() {
     const rr = h.reranker || {};
     const rrEnabled = rr.enabled === true;
     const rrName = String(rr.model || "reranker").split("/").pop();
-    const rrLabel = rrEnabled
-      ? (rr.loaded_offline === true ? `重排 ${rrName}（本地缓存）` : `重排 ${rrName}`)
-      : "重排未启用";
+    // 展示**实际**设备：配了 cuda 却回退 cpu 时，界面上能直接看出来
+    const rrDevice = rr.device ? ` · ${rr.device}` : "";
+    const rrLabel = rrEnabled ? `重排 ${rrName}${rrDevice}` : "重排未启用";
 
     const items = [
       { label: "稠密检索", on: true },
@@ -511,8 +559,13 @@ function addUserMessage(text) {
 function addAssistantMessage() {
   const el = document.createElement("div");
   el.className = "msg assistant";
+  // .thinking 一开始为空，靠 CSS :empty 隐藏；收到 thinking 事件后才出现
   el.innerHTML = `<div class="role">助手</div>
-                  <div class="bubble"><span class="answer"></span><span class="cursor"></span></div>
+                  <div class="bubble">
+                    <button class="thinking-toggle" type="button" hidden>思考过程（点击展开）</button>
+                    <div class="thinking"></div>
+                    <span class="answer"></span><span class="cursor"></span>
+                  </div>
                   <div class="sources"></div>`;
   $("thread").appendChild(el);
   scrollToBottom(true);
@@ -523,6 +576,32 @@ function addAssistantMessage() {
 function finishAssistantMessage(el) {
   const cursor = el.parentElement.querySelector(".cursor");
   if (cursor) cursor.remove();
+}
+
+/**
+ * 答案生成完毕后收起思考过程。
+ *
+ * 流式期间展开是为了让用户看到推理进展；答案出来后再占着版面就没意义了，
+ * 所以收成一行可点开的入口。没有思考内容时（非推理模型）什么都不做。
+ *
+ * Note:
+ *   用 ``onclick`` 而不是 ``addEventListener``，因为这个函数会被调用两次
+ *   （done 事件一次、最终渲染后一次），用 addEventListener 会叠加监听器，
+ *   点一下等于切换两次、看起来没反应。
+ */
+function collapseThinking(thinkingEl) {
+  if (!thinkingEl || !thinkingEl.textContent.trim()) return;
+
+  const toggle = thinkingEl.parentElement.querySelector(".thinking-toggle");
+  thinkingEl.classList.add("collapsed");
+  if (!toggle) return;
+
+  toggle.hidden = false;
+  toggle.textContent = "思考过程（点击展开）";
+  toggle.onclick = () => {
+    const collapsed = thinkingEl.classList.toggle("collapsed");
+    toggle.textContent = collapsed ? "思考过程（点击展开）" : "思考过程（点击收起）";
+  };
 }
 
 function showError(message) {
@@ -660,6 +739,7 @@ async function ask(question) {
   const answerEl = addAssistantMessage();
   const msgRoot = answerEl.closest(".msg");
   const sourcesEl = msgRoot.querySelector(".sources");
+  const thinkingEl = msgRoot.querySelector(".thinking");
 
   // 用于累积答案，最后统一渲染 Markdown——
   // 逐 token 重新解析 Markdown 会造成打字时的格式闪烁（例如 ** 刚出现时）
@@ -724,11 +804,16 @@ async function ask(question) {
           renderSources(sourcesEl, data.sources);
           // 引用卡片会撑高内容；贴底时要跟上，否则用户看着"卡"在半路
           if (stickToBottom) scrollToBottom();
+        } else if (event === "thinking") {
+          // 思考过程独立渲染：直接追加纯文本，不解析 Markdown（避免半截语法闪烁）
+          thinkingEl.textContent += data.text || "";
+          if (stickToBottom) mainEl.scrollTop = mainEl.scrollHeight;
         } else if (event === "token") {
           state.answerText += data.text || "";
           scheduleRender();
         } else if (event === "done") {
           finishAssistantMessage(answerEl);
+          collapseThinking(thinkingEl);
         } else if (event === "error") {
           finishAssistantMessage(answerEl);
           showError(data.message || "服务端处理失败");
@@ -741,6 +826,8 @@ async function ask(question) {
     await new Promise((r) => requestAnimationFrame(r));
     answerEl.innerHTML = renderMarkdown(state.answerText);
     finishAssistantMessage(answerEl);
+    // 兜底再收一次：若服务端没发 done（连接中断），思考块也不该一直摊着
+    collapseThinking(thinkingEl);
     if (stickToBottom) scrollToBottom();
 
   } catch (err) {

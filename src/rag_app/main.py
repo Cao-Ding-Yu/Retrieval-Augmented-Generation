@@ -6,6 +6,7 @@ rag-app or python -m rag_app.main
 from __future__ import annotations
 
 import logging
+
 import uvicorn
 
 from rag_app.api import create_app

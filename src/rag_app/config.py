@@ -34,7 +34,7 @@ class Settings(BaseSettings):
     # ---- Milvus ----
     milvus_uri: str = "http://localhost:19530"
     milvus_token: str = ""
-    milvus_collection: str = "rag_chunks_deepseek_4096"
+    milvus_collection: str = "rag_chunks"
 
     # ---- 检索 ----
     dense_top_k: int = Field(default=20, ge=1)
@@ -45,6 +45,13 @@ class Settings(BaseSettings):
     # ---- 重排 ----
     rerank_enabled: bool = True
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
+    reranker_device: str = "auto"
+    """重排模型跑在哪个设备：``auto`` / ``cpu`` / ``cuda`` / ``mps``。
+
+    ``auto`` 会优先用 CUDA，其次 Apple MPS，最后回退 CPU。
+    注意：即使选了 ``cuda``，也需要装的是 **CUDA 版 torch** ——
+    纯 CPU 轮子（``x.y.z+cpu``）里 ``torch.cuda.is_available()`` 恒为 False。
+    """
     rerank_top_n: int = Field(default=30, ge=1)
     final_top_k: int = Field(default=5, ge=1)
     hf_home: str = ""
@@ -59,7 +66,12 @@ class Settings(BaseSettings):
     # ---- 生成 ----
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
     max_context_chars: int = Field(default=10000, ge=500)
-    strip_thinking: bool = True
+    show_thinking: bool = True
+    """是否把推理模型的思考过程推给前端。
+
+    思考内容**始终**会从正文里剥离（否则会混进答案），
+    这个开关只决定"剥离出来的思考要不要一起发出去给用户看"。
+    """
 
     # ---- 服务 ----
     host: str = "127.0.0.1"

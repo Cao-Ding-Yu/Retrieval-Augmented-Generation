@@ -12,9 +12,11 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from rag_app.rag import (
     NO_CONTEXT_REPLY,
+    RAG,
     ThinkingStripper,
     build_messages,
     format_context,
+    resolve_device,
     strip_thinking,
 )
 from tests.conftest import make_hit
@@ -160,15 +162,11 @@ class TestStripping:
     def test_multiple_blocks_removed(self):
         assert strip_thinking(f"{OPEN}一{CLOSE}甲{OPEN}二{CLOSE}乙") == "甲乙"
 
-    def test_disabled_passes_through(self):
-        text = f"{OPEN}推理{CLOSE}答案"
-        assert strip_thinking(text, enabled=False) == text
-
     def test_only_thinking_yields_empty(self):
         assert strip_thinking(f"{OPEN}纯推理{CLOSE}") == ""
 
     def test_citation_inside_thinking_is_dropped(self):
-        """思考里的 [1] 会被前端误当成引用标记，必须一并丢弃。"""
+        """思考里的 [1] 会被前端误当成引用标记，必须与正文分开。"""
         text = f"{OPEN}根据资料 [1] 与 [2] 推断…{CLOSE}结论是混合检索 [1]。"
 
         result = strip_thinking(text)
@@ -177,47 +175,113 @@ class TestStripping:
         assert "[2]" not in result
 
 
+class TestThinkingExtraction:
+    """思考内容不再被丢弃，而是作为独立部分返回，供前端展示。"""
+
+    def test_feed_returns_answer_and_thinking(self):
+        stripper = ThinkingStripper()
+
+        answer, thinking = stripper.feed(f"开头{OPEN}推理内容{CLOSE}结尾")
+        tail, _ = stripper.flush()
+
+        # 末尾 "结尾"（2 字符）不足一个标签长度，会被缓冲到 flush
+        assert answer + tail == "开头结尾"
+        assert thinking == "推理内容"
+
+    def test_thinking_does_not_leak_tags(self):
+        stripper = ThinkingStripper()
+
+        _answer, thinking = stripper.feed(f"{OPEN}推理{CLOSE}答案")
+
+        assert "think" not in thinking
+        assert thinking == "推理"
+
+    def test_no_thinking_yields_empty_thinking(self):
+        stripper = ThinkingStripper()
+
+        answer, thinking = stripper.feed("普通回答")
+        tail, _ = stripper.flush()
+
+        assert thinking == ""
+        assert answer + tail == "普通回答"
+
+    def test_flush_returns_unclosed_thinking(self):
+        """模型被截断时，未闭合的思考仍算思考 —— 可以展示，但绝不能进答案。"""
+        stripper = ThinkingStripper()
+        stripper.feed(f"{OPEN}还没想完")
+
+        answer, thinking = stripper.flush()
+
+        assert answer == ""
+        assert thinking == "还没想完"
+
+    def test_flush_returns_buffered_answer(self):
+        stripper = ThinkingStripper()
+        stripper.feed("短")
+
+        answer, thinking = stripper.flush()
+
+        assert answer == "短"
+        assert thinking == ""
+
+
 class TestStreamingAcrossChunks:
     """跨 chunk 切分 —— 这正是不能用正则的原因。"""
 
-    def _run(self, chunks: list[str], enabled: bool = True) -> str:
-        stripper = ThinkingStripper(enabled=enabled)
-        return "".join(stripper.feed(c) for c in chunks) + stripper.flush()
+    def _run(self, chunks: list[str]) -> tuple[str, str]:
+        """返回 (正文, 思考) 的完整拼接结果。"""
+        stripper = ThinkingStripper()
+        answers, thinkings = [], []
+        for c in chunks:
+            a, t = stripper.feed(c)
+            answers.append(a)
+            thinkings.append(t)
+        a, t = stripper.flush()
+        answers.append(a)
+        thinkings.append(t)
+        return "".join(answers), "".join(thinkings)
 
     def test_open_tag_split_across_chunks(self):
-        result = self._run(["答案", OPEN[:4], OPEN[4:], "隐藏", CLOSE, "可见"])
+        answer, _ = self._run(["答案", OPEN[:4], OPEN[4:], "隐藏", CLOSE, "可见"])
 
-        assert result == "答案可见"
-        assert "think" not in result
+        assert answer == "答案可见"
+        assert "think" not in answer
 
     def test_close_tag_split_across_chunks(self):
-        result = self._run([OPEN + "推理", CLOSE[:5], CLOSE[5:], "正式答案"])
+        answer, _ = self._run([OPEN + "推理", CLOSE[:5], CLOSE[5:], "正式答案"])
 
-        assert result == "正式答案"
-        assert "think" not in result
+        assert answer == "正式答案"
+        assert "think" not in answer
 
     def test_character_by_character_streaming(self):
         """每次只来一个字符 —— 最容易暴露状态机缺陷的场景。"""
-        full = f"开头{OPEN}这段推理不应出现{CLOSE}结尾"
+        full = f"开头{OPEN}这段推理不应出现在正文{CLOSE}结尾"
 
-        result = self._run(list(full))
+        answer, thinking = self._run(list(full))
 
-        assert result == "开头结尾"
-        assert "推理" not in result
+        assert answer == "开头结尾"
+        assert thinking == "这段推理不应出现在正文"
+
+    def test_thinking_and_answer_are_disjoint(self):
+        """同一段文本要么进正文、要么进思考，不能两边都有。"""
+        full = f"甲{OPEN}乙{CLOSE}丙{OPEN}丁{CLOSE}戊"
+
+        answer, thinking = self._run(list(full))
+
+        assert answer == "甲丙戊"
+        assert thinking == "乙丁"
 
     def test_tail_is_flushed(self):
         """短输出会被缓冲几个字符，flush 时必须补发，否则末尾字符丢失。"""
-        assert self._run(["短"]) == "短"
-        assert self._run(["12345678"]) == "12345678"
+        assert self._run(["短"])[0] == "短"
+        assert self._run(["12345678"])[0] == "12345678"
 
-    def test_unterminated_thinking_discarded(self):
-        """模型被截断（没有结束标签）时，剩余内容属推理，应丢弃。"""
-        assert self._run([OPEN + "还没想完"]) == ""
+    def test_unterminated_thinking_kept_out_of_answer(self):
+        """模型被截断（没有结束标签）时，剩余内容不能出现在答案里。"""
+        answer, thinking = self._run([OPEN + "还没想完"])
 
-    def test_disabled_does_not_buffer(self):
-        stripper = ThinkingStripper(enabled=False)
-        assert stripper.feed("甲") == "甲"
-        assert stripper.flush() == ""
+        assert answer == ""
+        assert thinking == "还没想完"
 
 
 @pytest.mark.parametrize(
@@ -233,3 +297,119 @@ def test_never_crashes(text: str):
 def test_no_context_reply_is_explicit():
     """兜底文案要说明"没检索到"，而不是假装回答了问题。"""
     assert "没有检索到" in NO_CONTEXT_REPLY
+
+
+# ---------------------------------------------------------------------------
+# RAG.astream 的事件拆分
+# ---------------------------------------------------------------------------
+class _FakeChunk:
+    """模拟 ChatOllama 的流式 chunk。
+
+    新版 Ollama 把思考放在独立字段，langchain_ollama 转存为
+    ``additional_kwargs["reasoning_content"]``；``content`` 只含答案。
+    """
+
+    def __init__(self, content: str = "", reasoning: str | None = None) -> None:
+        self.content = content
+        self.additional_kwargs = {"reasoning_content": reasoning} if reasoning else {}
+
+
+class _FakeLLM:
+    def __init__(self, chunks: list[_FakeChunk]) -> None:
+        self._chunks = chunks
+
+    async def astream(self, messages):
+        for chunk in self._chunks:
+            yield chunk
+
+
+async def _collect(settings, chunks, show_thinking: bool = True):
+    settings = settings.model_copy(update={"show_thinking": show_thinking})
+    rag = RAG(settings)
+    rag.llm = _FakeLLM(chunks)
+    return [(kind, text) async for kind, text in rag.astream("问题", [])]
+
+
+class TestAstreamSplitsThinking:
+    """思考与答案必须分事件产出，且两个来源都要覆盖。"""
+
+    async def test_reasoning_content_field_becomes_thinking_event(self, settings):
+        """字段型思考（新版 Ollama）—— 之前只读 content，这类思考会被整个丢掉。"""
+        events = await _collect(settings, [
+            _FakeChunk(reasoning="先分析一下…"),
+            _FakeChunk(content="最终答案"),
+        ])
+
+        assert ("thinking", "先分析一下…") in events
+        assert ("answer", "最终答案") in events
+        answer = "".join(t for k, t in events if k == "answer")
+        assert "分析" not in answer
+
+    async def test_inline_tags_also_split(self, settings):
+        """标签型思考（老版本 Ollama）仍要能识别。"""
+        full = f"{OPEN}标签里的推理{CLOSE}正文答案"
+
+        events = await _collect(settings, [_FakeChunk(content=full)])
+
+        thinking = "".join(t for k, t in events if k == "thinking")
+        answer = "".join(t for k, t in events if k == "answer")
+        assert thinking == "标签里的推理"
+        assert answer == "正文答案"
+
+    async def test_both_sources_are_merged(self, settings):
+        """同一轮里既有字段、又有标签时，两者都要进入思考流。"""
+        events = await _collect(settings, [
+            _FakeChunk(reasoning="字段推理"),
+            _FakeChunk(content=f"{OPEN}标签推理{CLOSE}答案"),
+        ])
+
+        thinking = "".join(t for k, t in events if k == "thinking")
+        assert "字段推理" in thinking
+        assert "标签推理" in thinking
+
+    async def test_show_thinking_false_drops_thinking(self, settings):
+        """关闭展示时，思考完全不产出，但答案不受影响。"""
+        events = await _collect(
+            settings,
+            [_FakeChunk(reasoning="不该出现"), _FakeChunk(content="答案")],
+            show_thinking=False,
+        )
+
+        assert [k for k, _ in events] == ["answer"]
+        assert events[0][1] == "答案"
+
+    async def test_no_thinking_yields_only_answer(self, settings):
+        events = await _collect(settings, [_FakeChunk(content="纯答案")])
+
+        assert [k for k, _ in events] == ["answer"]
+
+
+# ---------------------------------------------------------------------------
+# 设备解析
+# ---------------------------------------------------------------------------
+class TestResolveDevice:
+    def test_cpu_is_always_available(self):
+        assert resolve_device("cpu") == "cpu"
+
+    def test_auto_returns_a_usable_device(self):
+        assert resolve_device("auto") in {"cpu", "cuda", "mps"}
+
+    def test_unknown_value_passes_through(self):
+        """未知值原样透传，交给 sentence-transformers 报错，避免这里猜错。"""
+        assert resolve_device("cuda:1") == "cuda:1"
+
+    def test_blank_means_auto(self):
+        assert resolve_device("") in {"cpu", "cuda", "mps"}
+
+    def test_explicit_cuda_raises_when_unavailable(self):
+        """显式要 cuda 但没有时，必须报错而不是悄悄退回 CPU。
+
+        悄悄退回的话，用户会以为自己在用 GPU，性能问题根本查不出来。
+        """
+        import torch
+
+        if torch.cuda.is_available():
+            pytest.skip("本机 CUDA 可用，无法验证报错分支")
+
+        with pytest.raises(RuntimeError, match="无法使用 CUDA"):
+            resolve_device("cuda")

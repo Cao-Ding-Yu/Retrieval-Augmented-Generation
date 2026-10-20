@@ -165,6 +165,34 @@ class TestChatStream:
         assert entry["score"] == pytest.approx(0.9123, abs=1e-6)
         assert entry["score_kind"] == "rerank"
 
+    def test_thinking_is_a_separate_event(self, settings):
+        """思考与答案必须走不同事件。
+
+        如果混在一个事件里，前端只能把思考拼进答案正文 ——
+        思考里的 "[1]" 就会被当成引用标记，答案区也不干净。
+        """
+        rag = FakeRAG(
+            settings, hits=[make_hit("k1")],
+            deltas=["最终答案"], thinking=["先想想…", "再想想…"],
+        )
+        client = build_client(settings, rag)
+
+        events = parse_sse(client.post("/chat", json={"message": "问题"}).text)
+        thinking = "".join(d["text"] for n, d in events if n == "thinking")
+        answer = "".join(d["text"] for n, d in events if n == "token")
+
+        assert thinking == "先想想…再想想…"
+        assert answer == "最终答案"
+        assert "想想" not in answer
+
+    def test_no_thinking_event_when_model_has_none(self, settings):
+        """非推理模型不产生 thinking 事件，前端不应出现空的思考区块。"""
+        client = build_client(settings, FakeRAG(settings, hits=[make_hit("k1")]))
+
+        events = parse_sse(client.post("/chat", json={"message": "问题"}).text)
+
+        assert "thinking" not in [n for n, _ in events]
+
     def test_sources_can_be_disabled(self, settings):
         client = build_client(settings, FakeRAG(settings, hits=[make_hit("k1")]))
 
