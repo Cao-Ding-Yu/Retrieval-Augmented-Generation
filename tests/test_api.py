@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 
+import pytest
 from fastapi.testclient import TestClient
 
 from rag_app.api import create_app
@@ -147,6 +148,22 @@ class TestChatStream:
         assert entry["is_hybrid_hit"] is True
         assert entry["source"] == "manual.pdf"
         assert entry["chunk_index"] == 3
+
+    def test_sources_carry_score_and_kind(self, settings):
+        """前端靠 score + score_kind 决定显示"重排 x.xxx"还是"RRF x.xxxxx"。
+
+        这两个字段缺一个，界面上就什么都不显示 —— 曾经因此丢过重排得分。
+        """
+        hit = make_hit("k1")
+        hit.score = 0.9123
+        hit.score_kind = "rerank"
+        client = build_client(settings, FakeRAG(settings, hits=[hit]))
+
+        events = parse_sse(client.post("/chat", json={"message": "问题"}).text)
+        entry = next(d for n, d in events if n == "sources")["sources"][0]
+
+        assert entry["score"] == pytest.approx(0.9123, abs=1e-6)
+        assert entry["score_kind"] == "rerank"
 
     def test_sources_can_be_disabled(self, settings):
         client = build_client(settings, FakeRAG(settings, hits=[make_hit("k1")]))

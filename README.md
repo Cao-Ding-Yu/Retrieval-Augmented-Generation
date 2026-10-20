@@ -148,7 +148,7 @@ curl.exe -N -X POST http://127.0.0.1:8000/chat `
 | `RRF_K` | 60 | 融合常数：越大越平均，越小越看重头部 |
 | `RERANK_TOP_N` | 30 | 送去重排的候选数（逐对前向，不能太多） |
 | `FINAL_TOP_K` | 5 | 最终交给模型的上下文条数 |
-| `BM25_ANALYZER_TYPE` | 空 | **中文语料请设 `chinese`**，否则词法分支基本失效（仅建集合时生效） |
+| `BM25_ANALYZER_TYPE` | `chinese` | **中文语料必须设 `chinese`**。留空时默认分析器把整句中文当成一个词，正常问句的 BM25 召回是 0 条，混合检索退化成纯向量检索（症状：所有引用都标"语义命中"）。仅建集合时生效，改了要重建集合 |
 | `RERANKER_OFFLINE_FIRST` | true | 优先读本地缓存，避免每次启动联网校验 |
 | `STRIP_THINKING` | true | 剥离推理模型的思考过程 |
 | `EMBEDDING_DIM` | 4096 | 必须与嵌入模型一致，否则写库报错 |

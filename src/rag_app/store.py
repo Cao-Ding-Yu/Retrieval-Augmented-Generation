@@ -69,13 +69,20 @@ class Hit:
     source: str
     chunk_index: int
     score: float
-    """当前生效的分数。单分支检索时是该分支原始分；融合后是 RRF 分数。"""
+    """当前生效的分数。融合后是 RRF 分数；重排后会被替换成重排分数。"""
 
     dense_rank: int | None = None
     """在稠密分支中的名次（0 起）。未命中该分支为 None。"""
 
     sparse_rank: int | None = None
     """在 BM25 分支中的名次（0 起）。未命中该分支为 None。"""
+
+    score_kind: str = "rrf"
+    """``score`` 是哪种分数：``"rrf"``（融合分）或 ``"rerank"``（重排分）。
+
+    前端靠它决定显示"RRF x.xxxxx"还是"重排 x.xxx"，以及保留几位小数 ——
+    RRF 分很小（1/61 ≈ 0.016），重排分在 0~1 之间，两者的有效位数差别很大。
+    """
 
     @property
     def is_hybrid_hit(self) -> bool:
@@ -88,11 +95,15 @@ class Hit:
             "doc_id": self.doc_id,
             "source": self.source,
             "chunk_index": self.chunk_index,
-            "score": round(self.score, 4),
+            "score": round(self.score, 6),
+            "score_kind": self.score_kind,
             "dense_rank": self.dense_rank,
             "sparse_rank": self.sparse_rank,
             "is_hybrid_hit": self.is_hybrid_hit,
+            # snippet 用于折叠态预览，text 用于展开态看全文。
+            # 只发 snippet 的话"展开"就成了空操作 —— 前端两个状态会显示同一段截断文字。
             "snippet": self.text[:280] + ("…" if len(self.text) > 280 else ""),
+            "text": self.text,
         }
 
 

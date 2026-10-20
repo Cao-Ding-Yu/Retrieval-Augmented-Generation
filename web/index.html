@@ -12,7 +12,7 @@
   前端框架与之正交，因此先用最轻的方式验证端到端流程。
 
   marked.js 用于渲染 Markdown。它是唯一的外部依赖，且做了离线降级：
-  若 CDN 不可达（纯内网环境很常见），会退化为纯文本显示，功能不受影响。
+  若 CDN 不可达，会退化为纯文本显示，功能不受影响。
 -->
 <script src="https://cdn.jsdelivr.net/npm/marked@12/marked.min.js"></script>
 
@@ -46,7 +46,9 @@
   }
 
   /* ==================== 布局 ==================== */
-  .app { display: flex; flex-direction: column; height: 100vh; }
+  /* 100dvh 作为 100vh 的补充：移动端浏览器地址栏伸缩会让 100vh 溢出，
+     导致底部输入框被裁掉。不支持的浏览器会忽略第二行、沿用 100vh。 */
+  .app { display: flex; flex-direction: column; height: 100vh; height: 100dvh; }
 
   header {
     display: flex; align-items: center; gap: 12px;
@@ -159,9 +161,21 @@
   .source .src-name { color: var(--text); }
   .source .src-meta { font-size: 11px; color: var(--text-faint); }
   .source .src-snippet { color: var(--text-dim); line-height: 1.5; }
-  .source .src-full { display: none; margin-top: 6px; white-space: pre-wrap; }
+  /* 展开态用正常的自动折行，**不要**用 pre-wrap：
+     PDF 抽出来的文本每十几个字就带一个硬换行（对应原 PDF 的视觉行宽），
+     保留这些换行会让展开后只有左侧窄窄一列有字、右侧全空。
+     用 normal 让浏览器按容器宽度重新折行，读起来才正常。 */
+  .source .src-full {
+    display: none;
+    margin-top: 6px;
+    white-space: normal;
+    overflow-wrap: anywhere;   /* 超长英文单词/URL 也能断行，避免撑破卡片 */
+    line-height: 1.65;
+  }
   .source.expanded .src-full { display: block; }
   .source.expanded .src-snippet { display: none; }
+  /* 展开时给卡片一点视觉区分，便于看出当前展开的是哪一条 */
+  .source.expanded { border-color: #3a4256; background: #1b1f29; }
 
   /* 打分徽章：用颜色区分"双分支命中"与"单分支命中" */
   .badge {
@@ -173,6 +187,27 @@
   .badge.sparse { background: #3a3120; color: var(--warn); }
   /* 服务端融合下拿不到分支名次，用中性徽章，避免被误标成"语义命中" */
   .badge.fused  { background: #262a35; color: var(--text-dim); }
+
+  /* "回到最新"悬浮按钮：用户往上翻看历史内容时出现。
+     没有它的话，流式输出期间用户滚上去就看不懂"为什么又跳回底部了"。 */
+  .jump-bottom {
+    position: fixed;
+    right: 28px;
+    bottom: 104px;                 /* 悬在输入框上方，不挡住 composer */
+    padding: 7px 14px;
+    border-radius: 999px;
+    border: 1px solid #35405a;
+    background: var(--bg-elevated);
+    color: var(--text);
+    font-size: 12.5px;
+    cursor: pointer;
+    box-shadow: 0 4px 14px rgba(0, 0, 0, .35);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity .15s;
+    z-index: 20;
+  }
+  .jump-bottom.show { opacity: 1; pointer-events: auto; }
 
   /* ==================== 输入区 ==================== */
   footer {
@@ -238,6 +273,8 @@
     </div>
   </main>
 
+  <button class="jump-bottom" id="jumpBottom" type="button">↓ 回到最新</button>
+
   <footer>
     <div class="composer">
       <textarea id="input" rows="1"
@@ -255,10 +292,8 @@
    全局状态
    ========================================================================== */
 const state = {
-  busy: false,        // 是否正在等待响应，用于禁用输入防重复提交
-  answerEl: null,     // 当前正在流式写入的答案元素
+  busy: false,        // 是否正在生成，用于防重复提交
   answerText: "",     // 已累积的答案文本
-  controller: null,   // AbortController，用于中断流式请求
 };
 
 const $ = (id) => document.getElementById(id);
@@ -268,18 +303,25 @@ const $ = (id) => document.getElementById(id);
    ========================================================================== */
 
 /**
- * 渲染 Markdown。marked 不可用（离线环境）时降级为转义后的纯文本，
- * 保证内容始终可读，而不是直接报错或显示 undefined。
+ * 渲染 Markdown。marked 不可用（离线环境）时降级为转义后的纯文本。
+ *
+ * 安全注意：结果会被塞进 innerHTML，而内容来自模型输出（可能包含文档里的原文）。
+ * 所以**先转义 HTML 再交给 marked** —— 否则文档里若带 `<img onerror=...>`，
+ * 就会被当成标签执行。我们不需要 Markdown 里的原始 HTML，转义没有功能损失。
  */
 function renderMarkdown(text) {
+  const safe = escapeHtml(text);
+
   if (window.marked && typeof window.marked.parse === "function") {
     try {
-      return window.marked.parse(text, { breaks: true });
+      const html = window.marked.parse(safe, { breaks: true });
+      // 兜底：Markdown 的链接语法仍能造出 javascript: 协议，直接中和掉
+      return html.replace(/href="\s*javascript:[^"]*"/gi, 'href="#"');
     } catch (e) {
       console.warn("Markdown 渲染失败，降级为纯文本", e);
     }
   }
-  return escapeHtml(text).replace(/\n/g, "<br>");
+  return safe.replace(/\n/g, "<br>");
 }
 
 /** HTML 转义。用户输入要插进 innerHTML 时必经此函数，防止 XSS。 */
@@ -289,13 +331,96 @@ function escapeHtml(s) {
     .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
-/** 滚动到底部。用 requestAnimationFrame 让浏览器先完成布局再滚动。 */
-function scrollToBottom() {
+/* ==========================================================================
+   自动滚动：贴底跟随
+   ========================================================================== */
+
+// 流式输出期间若每帧都无条件 `scrollTop = scrollHeight`，用户根本没法往上翻 ——
+// 一滚就被拽回底部。所以只在"用户本来就在底部"时跟随。
+//
+// 三个关键细节（也是之前偶发"被锁在底部"的真正原因）：
+//   1. `scroll` 事件是**异步派发**的。等它到达时，我们排的渲染 rAF 可能已经先跑，
+//      按尚未更新的 stickToBottom 把页面拉回了底部。所以不能只靠 scroll 判断，
+//      必须同时监听 wheel / touchmove / keydown 这些**同步**的用户意图信号。
+//   2. 阈值必须小。用大阈值（比如 80px）时，用户往上滚一点点仍被算作"在底部"，
+//      下一个 token 就把他拽回去 —— 手感就是"不跟手、偶尔被锁住"。
+//   3. rAF 里要**再判一次**：这一帧内用户可能已经上滚了。
+
+const STICK_EPSILON = 8;        // 距底多少像素内算"贴底"
+const mainEl = $("main");
+const jumpBtn = $("jumpBottom");
+
+let stickToBottom = true;
+
+/** 当前是否停在底部附近。 */
+function isNearBottom() {
+  return mainEl.scrollHeight - mainEl.scrollTop - mainEl.clientHeight <= STICK_EPSILON;
+}
+
+/** 同步"回到最新"按钮的显隐。 */
+function syncJumpButton() {
+  jumpBtn.classList.toggle("show", !stickToBottom);
+}
+
+/** 用户表达了"要往上翻"的意图 —— 立刻停止跟随（同步生效，赶在 rAF 之前）。 */
+function stopFollowing() {
+  if (!stickToBottom) return;
+  stickToBottom = false;
+  syncJumpButton();
+}
+
+/**
+ * 滚动到底部，受贴底状态约束。
+ *
+ * @param {boolean} force 为 true 时无视贴底状态强制滚动 ——
+ *   发新消息、出现错误这类"必须让用户看到"的场景用它。
+ */
+function scrollToBottom(force = false) {
+  if (!force && !stickToBottom) return;
   requestAnimationFrame(() => {
-    const main = $("main");
-    main.scrollTop = main.scrollHeight;
+    // 二次确认：这一帧内用户可能已经上滚，此时不该再把他拉回来
+    if (!force && !stickToBottom) return;
+    mainEl.scrollTop = mainEl.scrollHeight;
+    stickToBottom = true;
+    syncJumpButton();
   });
 }
+
+// ---- 同步的用户意图信号（早于 scroll 事件与 rAF）----
+// 滚轮向上 / 双指上滑
+mainEl.addEventListener("wheel", (e) => {
+  if (e.deltaY < 0) stopFollowing();
+}, { passive: true });
+
+// 触摸：手指往下拖 ⇒ 内容往上滚 ⇒ 用户想看更早的内容
+let touchStartY = 0;
+mainEl.addEventListener("touchstart", (e) => {
+  touchStartY = e.touches[0] ? e.touches[0].clientY : 0;
+}, { passive: true });
+mainEl.addEventListener("touchmove", (e) => {
+  const y = e.touches[0] ? e.touches[0].clientY : touchStartY;
+  if (y - touchStartY > 8) stopFollowing();
+}, { passive: true });
+
+// 键盘：翻页键/上键
+mainEl.addEventListener("keydown", (e) => {
+  if (e.key === "ArrowUp" || e.key === "PageUp" || e.key === "Home") stopFollowing();
+});
+
+// ---- scroll 事件作为兜底 ----
+// 覆盖"拖滚动条"这类没有 wheel/touch 信号的操作，以及"滚回底部恢复跟随"。
+mainEl.addEventListener("scroll", () => {
+  const near = isNearBottom();
+  if (near !== stickToBottom) {
+    stickToBottom = near;
+    syncJumpButton();
+  }
+});
+
+jumpBtn.addEventListener("click", () => {
+  scrollToBottom(true);
+  input.focus();
+});
 
 /* ==========================================================================
    服务状态探测
@@ -378,7 +503,7 @@ function addUserMessage(text) {
   el.innerHTML = `<div class="role">你</div>
                   <div class="bubble">${escapeHtml(text)}</div>`;
   $("thread").appendChild(el);
-  scrollToBottom();
+  scrollToBottom(true);
   return el;
 }
 
@@ -390,7 +515,7 @@ function addAssistantMessage() {
                   <div class="bubble"><span class="answer"></span><span class="cursor"></span></div>
                   <div class="sources"></div>`;
   $("thread").appendChild(el);
-  scrollToBottom();
+  scrollToBottom(true);
   return el.querySelector(".answer");
 }
 
@@ -406,7 +531,7 @@ function showError(message) {
   el.innerHTML = `<div class="role">错误</div>
                   <div class="bubble"><div class="error">${escapeHtml(message)}</div></div>`;
   $("thread").appendChild(el);
-  scrollToBottom();
+  scrollToBottom(true);
 }
 
 /**
@@ -414,26 +539,23 @@ function showError(message) {
  * 分数与命中分支都展示出来，让"为什么这条被选中"可被检验——
  * 这是检索系统可解释性的最小实现。
  */
-function renderSources(container, sources, meta) {
+function renderSources(container, sources) {
   if (!sources || !sources.length) {
     container.innerHTML = `<div class="sources-title">未检索到相关内容</div>`;
     return;
   }
 
-  const head = `<div class="sources-title">
-      检索到 ${sources.length} 条上下文
-      · 候选 ${sources.length} 条
-    </div>`;
+  const head = `<div class="sources-title">检索到 ${sources.length} 条上下文</div>`;
 
   const cards = sources.map((s, i) => {
-    // 命中分支决定徽章。
-    // 注意第三种情况：服务端融合（Milvus 2.5+ 的 BM25 Function）只返回融合后的
-    // 结果，不带各分支名次，此时两个 rank 都是 null。这种情况必须用中性徽章，
-    // 否则会被默认值误标成"语义命中"—— 那是在陈述一个我们并不知道的事实。
+    // 命中分支决定徽章：
+    //   双分支命中 = 语义与关键词都命中（最强信号）
+    //   仅稀疏命中 = 关键词命中
+    //   仅稠密命中 = 语义命中
     const hasDenseRank = s.dense_rank !== null && s.dense_rank !== undefined;
     const hasSparseRank = s.sparse_rank !== null && s.sparse_rank !== undefined;
 
-    let badgeClass = "fused", badgeText = "融合排序";
+    let badgeClass = "fused", badgeText = "未知来源";
     if (s.is_hybrid_hit) {
       badgeClass = "hybrid"; badgeText = "双分支命中";
     } else if (hasSparseRank) {
@@ -442,15 +564,17 @@ function renderSources(container, sources, meta) {
       badgeClass = "dense"; badgeText = "语义命中";
     }
 
-    // 分数：优先展示重排分数，否则展示 RRF 分数
-    const scoreText = (s.rerank_score !== null && s.rerank_score !== undefined)
-      ? `重排 ${s.rerank_score.toFixed(3)}`
-      : (s.rrf_score !== null && s.rrf_score !== undefined)
-        ? `RRF ${s.rrf_score.toFixed(5)}` : "";
+    // 分数：后端只给一个 score + score_kind 标明它是哪种分。
+    // 两者有效位数差别很大 —— RRF 分约 0.016，重排分在 0~1 之间。
+    const scoreText = (s.score !== null && s.score !== undefined)
+      ? (s.score_kind === "rerank"
+          ? `重排 ${Number(s.score).toFixed(3)}`
+          : `RRF ${Number(s.score).toFixed(5)}`)
+      : "";
 
     const rankParts = [];
-    if (s.dense_rank !== null && s.dense_rank !== undefined) rankParts.push(`稠密#${s.dense_rank + 1}`);
-    if (s.sparse_rank !== null && s.sparse_rank !== undefined) rankParts.push(`稀疏#${s.sparse_rank + 1}`);
+    if (hasDenseRank) rankParts.push(`稠密#${s.dense_rank + 1}`);
+    if (hasSparseRank) rankParts.push(`稀疏#${s.sparse_rank + 1}`);
 
     return `
       <div class="source" data-idx="${i}">
@@ -463,7 +587,7 @@ function renderSources(container, sources, meta) {
           ${rankParts.length ? `<span class="src-meta">${escapeHtml(rankParts.join(" · "))}</span>` : ""}
         </div>
         <div class="src-snippet">${escapeHtml(s.snippet || "")}</div>
-        <div class="src-full">${escapeHtml(s.snippet || "")}</div>
+        <div class="src-full">${escapeHtml(s.text || s.snippet || "")}</div>
       </div>`;
   }).join("");
 
@@ -533,7 +657,6 @@ async function ask(question) {
 
   // 用于累积答案，最后统一渲染 Markdown——
   // 逐 token 重新解析 Markdown 会造成打字时的格式闪烁（例如 ** 刚出现时）
-  state.answerEl = answerEl;
   state.answerText = "";
 
   let rafPending = false;
@@ -543,9 +666,11 @@ async function ask(question) {
     if (rafPending) return;
     rafPending = true;
     requestAnimationFrame(() => {
-      answerEl.textContent = state.answerText;
       rafPending = false;
-      scrollToBottom();
+      answerEl.textContent = state.answerText;
+      // 在**同一帧**内完成滚动：之前是再排一个 rAF 去滚，
+      // 多滞后一帧，手感上就是"跟不上"。
+      if (stickToBottom) mainEl.scrollTop = mainEl.scrollHeight;
     });
   };
 
@@ -590,7 +715,9 @@ async function ask(question) {
         const { event, data } = parsed;
 
         if (event === "sources") {
-          renderSources(sourcesEl, data.sources, data);
+          renderSources(sourcesEl, data.sources);
+          // 引用卡片会撑高内容；贴底时要跟上，否则用户看着"卡"在半路
+          if (stickToBottom) scrollToBottom();
         } else if (event === "token") {
           state.answerText += data.text || "";
           scheduleRender();
@@ -603,10 +730,12 @@ async function ask(question) {
       }
     }
 
-    // 收尾：把累积文本渲染成 Markdown
+    // 收尾：把累积文本渲染成 Markdown。
+    // 这一步会改变高度（列表、代码块、标题间距），所以贴底时要重新对齐一次。
     await new Promise((r) => requestAnimationFrame(r));
     answerEl.innerHTML = renderMarkdown(state.answerText);
     finishAssistantMessage(answerEl);
+    if (stickToBottom) scrollToBottom();
 
   } catch (err) {
     finishAssistantMessage(answerEl);
@@ -647,6 +776,8 @@ input.addEventListener("keydown", (e) => {
   }
 });
 $("send").addEventListener("click", submit);
+
+// 滚动跟随的监听器注册在"自动滚动"那一节（与滚动逻辑放在一起，避免两处各绑一半）
 
 // 启动时探测服务状态
 refreshHealth();

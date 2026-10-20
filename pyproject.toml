@@ -60,7 +60,9 @@ pythonpath = ["src", "."]
 testpaths = ["tests"]
 
 [tool.ruff]
-line-length = 100
+# 110 而不是常见的 100：ruff 的行宽按**显示宽度**计算，一个中文字符占 2 列。
+# 本项目的注释与文档字符串都是中文，用 100 会让正常的中文说明频繁超限。
+line-length = 110
 target-version = "py311"
 
 [tool.ruff.lint]

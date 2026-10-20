@@ -157,6 +157,8 @@ class RAG:
         for index in order[:limit]:
             hit = hits[index]
             hit.score = scores[index]
+            # 标记分数来源，前端据此显示"重排"而不是"RRF"
+            hit.score_kind = "rerank"
             result.append(hit)
         return result
 
