@@ -1,12 +1,9 @@
-"""配置与日志。
+"""
+配置与日志
 
-整个应用只有这一个配置来源：环境变量 / .env 文件。
-代码里不硬编码任何地址、模型名或阈值。
-
-用法::
-
+用法:
     from rag_app.config import get_settings
-    settings = get_settings()          # 带缓存，全进程只解析一次
+    settings = get_settings()
 """
 
 from __future__ import annotations
@@ -19,7 +16,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    """全局配置。字段名（小写）自动对应环境变量（大写）。"""
+    """全局配置"""
 
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -37,13 +34,13 @@ class Settings(BaseSettings):
     # ---- Milvus ----
     milvus_uri: str = "http://localhost:19530"
     milvus_token: str = ""
-    milvus_collection: str = "rag_chunks_qwen3_4096"
+    milvus_collection: str = "rag_chunks_deepseek_4096"
 
     # ---- 检索 ----
     dense_top_k: int = Field(default=20, ge=1)
     sparse_top_k: int = Field(default=20, ge=1)
     rrf_k: int = Field(default=60, ge=1)
-    bm25_analyzer_type: str = ""
+    bm25_analyzer_type: str = "chinese"
 
     # ---- 重排 ----
     rerank_enabled: bool = True
@@ -61,7 +58,7 @@ class Settings(BaseSettings):
 
     # ---- 生成 ----
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
-    max_context_chars: int = Field(default=6000, ge=500)
+    max_context_chars: int = Field(default=10000, ge=500)
     strip_thinking: bool = True
 
     # ---- 服务 ----
@@ -72,26 +69,26 @@ class Settings(BaseSettings):
     @field_validator("chunk_overlap")
     @classmethod
     def _overlap_smaller_than_chunk(cls, v: int, info: ValidationInfo) -> int:
-        """重叠必须小于块大小，否则切分无法推进。"""
-        chunk_size = info.data.get("chunk_size", 800)
+        """重叠必须小于块大小"""
+        chunk_size = info.data.get("chunk_size")
         if v >= chunk_size:
             raise ValueError(f"chunk_overlap({v}) 必须小于 chunk_size({chunk_size})")
         return v
 
     @property
     def milvus_token_or_none(self) -> str | None:
-        """pymilvus 无鉴权时应传 None 而非空串。"""
+        """pymilvus 无鉴权时应传 None 而非空串"""
         return self.milvus_token or None
 
 
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
-    """全局唯一配置实例（带缓存，.env 只解析一次）。"""
+    """全局配置实例"""
     return Settings()
 
 
 def configure_logging(level: str = "info", *, verbose: bool = False) -> None:
-    """统一的日志格式与降噪。Web 服务与 CLI 共用，避免两处漂移。"""
+    """统一的日志格式(Web 服务与 CLI 共用)"""
     logging.basicConfig(
         level="DEBUG" if verbose else level.upper(),
         format="%(asctime)s | %(levelname)-7s | %(name)-24s | %(message)s",
@@ -107,5 +104,4 @@ def configure_logging(level: str = "info", *, verbose: bool = False) -> None:
         "sentence_transformers",
         "transformers",
         "filelock",
-    ):
-        logging.getLogger(name).setLevel(logging.WARNING)
+    ): logging.getLogger(name).setLevel(logging.WARNING)

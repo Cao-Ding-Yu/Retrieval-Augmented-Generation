@@ -1,10 +1,7 @@
-"""命令行工具：入库 / 检索调试 / 查看概况。
-
-复用与 Web 服务**完全相同**的 ``RAG`` 组装流程，所以 CLI 里验证过的行为
-就是线上行为，不会出现"脚本能搜到、接口搜不到"这类不一致。
-
+"""
+命令行工具：入库 / 检索调试 / 查看概况：
     rag-app-cli ingest ./data
-    rag-app-cli search "RRF 是怎么工作的"
+    rag-app-cli search "问题"
     rag-app-cli stats
 """
 

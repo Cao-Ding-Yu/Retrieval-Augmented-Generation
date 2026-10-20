@@ -1,18 +1,8 @@
-"""RAG 主流程：检索 → 重排 → 组装提示词 → 流式生成。
-
-整条链路集中在这一个文件里，``RAG.retrieve()`` 就能从上到下读完。
-调用关系只有两层：
+"""
+主流程：检索 → 重排 → 组装提示词 → 流式生成
 
     api.py  →  RAG.aretrieve()  →  store.dense_search / sparse_search / fuse
             →  RAG.astream()    →  llm.astream
-
-## 为什么检索要分两个分支再做融合
-
-- **稠密检索**（向量）擅长语义相近但措辞不同的情况，但漏精确标识符
-  （错误码、版本号、专有名词）。
-- **BM25 检索**（关键词）正好相反：精确词命中极强，但不认识同义词。
-
-两者互补，所以各跑一次，再用 RRF 按名次融合（见 store.fuse 的说明）。
 """
 
 from __future__ import annotations
@@ -32,9 +22,7 @@ from rag_app.store import Hit, MilvusStore, fuse
 
 logger = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """你是一个严谨的知识库问答助手。你的回答必须完全基于用户提供的【参考资料】。
-
-规则：
+SYSTEM_PROMPT = """你是一个严谨的知识库问答助手。你的回答必须完全基于用户提供的【参考资料】。规则：
 1. 只使用【参考资料】中的信息作答，不要用你自己的先验知识补充或推测。
 2. 每个结论后标注来源编号，格式为 [1]、[2]，可同时标注多个如 [1][3]。
 3. 如果资料不足以回答，直接说明"根据已有资料无法回答该问题"，禁止编造。
@@ -42,7 +30,7 @@ SYSTEM_PROMPT = """你是一个严谨的知识库问答助手。你的回答必�
 5. 使用与提问相同的语言，需要列举时用有序列表。
 6. 不要复述这些规则，直接给出答案。"""
 
-# 检索为空时的兜底文案（此时不调用模型，省一次推理）
+# 检索为空时的兜底文案
 NO_CONTEXT_REPLY = (
     "我在当前知识库中没有检索到与该问题相关的内容。"
     "请换个说法，或先向知识库补充相关文档。"
@@ -53,7 +41,7 @@ NO_CONTEXT_REPLY = (
 # 主类
 # ===========================================================================
 class RAG:
-    """把检索、重排、生成串起来。整个应用只创建一个实例。"""
+    """检索、重排、生成"""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -73,7 +61,7 @@ class RAG:
 
         self._reranker: _Reranker | None = None
         self.rerank_warning: str | None = None
-        """重排加载失败时的原因，会显示在健康检查与前端告警条里。"""
+        """重排加载失败时的原因，会显示在健康检查与前端告警条里"""
 
     # ------------------------------------------------------------------
     # 启动 / 关闭
@@ -252,38 +240,20 @@ def format_context(hits: list[Hit], max_chars: int) -> str:
 # 重排器
 # ===========================================================================
 class _Reranker:
-    """交叉编码器重排器。
-
-    ## 为什么还需要第二阶段重排
-
-    稠密检索用的双编码器把查询和文档**分别**编码，为了能预建索引而牺牲了交互 ——
-    编码文档时根本不知道查询是什么。
-
-    交叉编码器把 (查询, 文档) 拼成一个序列一起送进模型，注意力可直接在两者间交互，
-    判断准确得多；代价是无法预计算，N 个候选要跑 N 次前向。
-    所以只对前几十条候选做精排。
-    """
+    """交叉编码器重排器"""
 
     def __init__(self, settings: Settings) -> None:
         self._settings = settings
         self._model: Any = None
 
     def load(self) -> None:
-        """加载模型（离线优先）。
+        """
+        加载模型
 
-        三级降级，从最稳到最兜底：
-          1. 自己按 HF 缓存布局定位 ``snapshots/<commit>/``，以**本地目录**加载 ——
-             完全跳过仓库解析与 etag 校验；
+        三级加载顺序：
+          1. 按 HF 缓存定位，跳过仓库解析与 etag 校验；
           2. 按仓库名加载但带 ``local_files_only=True``；
-          3. 前两级都失败才联网下载。
-
-        ## 为什么需要第 1 级
-
-        HuggingFace 默认每次加载都会向远端校验 etag，即使文件都在本地。
-        在国内网络下这一步常超时数秒甚至失败，报错是
-        "couldn't connect ... couldn't find them in the cached files" ——
-        但文件其实就在磁盘上，失败发生在**仓库解析**环节而非文件缺失，极具误导性。
-        直接传本地目录则不走这套流程。
+          3. 联网下载
         """
         from sentence_transformers import CrossEncoder
 
@@ -317,8 +287,7 @@ class _Reranker:
         if not documents:
             return []
         pairs = [(question, doc) for doc in documents]
-        return [float(s) for s in self._model.predict(pairs, batch_size=16,
-                                                      show_progress_bar=False)]
+        return [float(s) for s in self._model.predict(pairs, batch_size=16, show_progress_bar=False)]
 
 
 def _apply_hf_env(settings: Settings) -> None:

@@ -1,13 +1,11 @@
-"""服务启动入口。
-
-    rag-app                     # 安装后
-    python -m rag_app.main      # 或直接跑模块
+"""
+服务启动入口
+rag-app or python -m rag_app.main
 """
 
 from __future__ import annotations
 
 import logging
-
 import uvicorn
 
 from rag_app.api import create_app
