@@ -1,7 +1,8 @@
 # RAG 知识库问答系统
 
 本地部署的检索增强生成（Retrieval-Augmented Generation）服务：基于 Milvus 的稠密 + BM25 混合检索，
-经 RRF 融合与交叉编码器重排后，交由本地大模型生成带引用的答案，并通过 SSE 以流式方式返回。
+先用 RAG-Fusion 把原问题拆解为子问题做多路召回，经两层 RRF 融合与交叉编码器重排后，
+交由本地大模型生成带引用的答案，并通过 SSE 以流式方式返回。
 
 后端由 8 个源文件构成，不依赖任何外部 API。
 
@@ -45,11 +46,12 @@
 | 特性 | 实现方式 |
 |---|---|
 | 混合检索 | 稠密向量（`qwen3-embedding:8b`，4096 维）+ Milvus 服务端 BM25，两路召回互补 |
+| RAG-Fusion | LLM 把原问题拆解为子问题（原问题保留），每路各召回 15 条，两层 RRF 融合 |
 | RRF 融合 | 仅使用排名而非分数，规避不同量纲不可比的问题；实现为纯函数，可精确单测 |
 | 交叉编码器重排 | `BAAI/bge-reranker-v2-m3` 对融合后的候选精排，支持 CPU / CUDA / Apple MPS |
 | 重排离线加载 | 命中本地缓存时零网络请求，规避 HuggingFace etag 校验超时 |
 | 思考过程分离 | 推理模型的思考与答案作为两个独立的 SSE 事件下发，网页端独立渲染、生成完毕后自动收起 |
-| 可解释检索 | 每条结果返回 `score`、`score_kind`、`dense_rank`、`sparse_rank`、PDF 页码 |
+| 可解释检索 | 每条结果返回 `score`、`score_kind`、`recalls`（被哪些查询以哪种形式召回）、PDF 页码 |
 | 流式输出 | SSE 逐 token 推送，前端使用 `fetch` + `ReadableStream` 解析 |
 | 幂等入库 | 以文件路径派生的 `doc_id` 先删后插，重复入库不产生冗余数据 |
 | 优雅降级 | Milvus 或重排模型不可用时服务仍可启动，并通过 `/health` 报告具体原因 |
@@ -68,13 +70,14 @@
                                              │ RAG.aretrieve() / RAG.astream()
                          ┌───────────────────▼─────────────────────┐
                          │ rag.py                                  │
-                         │   1. embed_query        查询向量化       │
+                         │   1. _generate_sub_queries 拆解子问题    │
                          │   2. dense_search       稠密召回         │
                          │   3. sparse_search      BM25 召回        │
-                         │   4. fuse               RRF 融合         │
-                         │   5. _rerank            交叉编码器精排   │
-                         │   6. llm.astream        流式生成         │
-                         │   7. ThinkingStripper   思考/答案分离    │
+                         │   4. fuse               每问题 RRF 融合  │
+                         │   5. fuse_rankings      跨问题 RRF 融合  │
+                         │   6. _rerank            交叉编码器精排   │
+                         │   7. llm.astream        流式生成         │
+                         │   8. ThinkingStripper   思考/答案分离    │
                          └───────────────────┬─────────────────────┘
                                              │
                          ┌───────────────────▼─────────────────────┐
@@ -91,12 +94,16 @@
 
 | 阶段 | 实现 | 说明 |
 |---|---|---|
-| 查询向量化 | Ollama `/api/embed` | 单次网络往返 |
-| 稠密召回 | HNSW，`ef = max(128, k)` | 余弦相似度 |
+| 查询拆解 | LLM 改写 `FUSION_SUB_QUERIES` 个子问题 | 原问题始终保留，共 `1 + N` 路查询 |
+| 查询向量化 | Ollama `/api/embed` | 每路查询一次网络往返 |
+| 稠密召回 | HNSW，`ef = max(128, k)` | 余弦相似度，每路各召回 `FUSION_RECALL_K` 条 |
 | 词法召回 | 服务端 BM25 Function | 传入原始文本，由 Milvus 分词并打分 |
-| 融合 | `fuse()`，RRF `k=60` | 纯函数，输入输出均为 `list[Hit]` |
-| 重排 | 交叉编码器，逐对前向 | 仅对 `RERANK_TOP_N` 条候选计算 |
+| 融合 | `fuse()` + `fuse_rankings()`，RRF `k=60` | 第一层融合同一问题的两分支，第二层融合多个问题的排序 |
+| 重排 | 交叉编码器，逐对前向 | 用**原问题**对 `RERANK_TOP_N` 条候选精排 |
 | 生成 | Ollama `/api/chat` | 流式返回 |
+
+每个分块的召回溯源（被哪些查询、以哪种形式召回）记录在 `Hit.recalls`，
+随 `sources` 事件/接口返回，前端"问题拆解"与引用卡片直接展示。
 
 依赖方向为单向一层：`api → rag → store`，不存在循环依赖或回调注册。
 
@@ -214,13 +221,14 @@ rag-app-cli search "某个问题"
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `DENSE_TOP_K` | `20` | 稠密分支召回条数 |
-| `SPARSE_TOP_K` | `20` | BM25 分支召回条数 |
+| `FUSION_ENABLED` | `true` | 是否启用 RAG-Fusion 查询拆解；关闭后只用原问题检索 |
+| `FUSION_SUB_QUERIES` | `2` | 额外生成的子问题数；原问题始终保留 |
+| `FUSION_RECALL_K` | `15` | 每个问题（含原问题）召回并保留的分块数 |
 | `RRF_K` | `60` | RRF 平滑常数；越小越看重头部排名 |
 | `RERANK_ENABLED` | `true` | 是否启用重排 |
 | `RERANKER_MODEL` | `BAAI/bge-reranker-v2-m3` | 交叉编码器模型 |
 | `RERANKER_DEVICE` | `auto` | `auto` / `cpu` / `cuda` / `mps` |
-| `RERANK_TOP_N` | `30` | 送入重排的候选数 |
+| `RERANK_TOP_N` | `20` | 送入重排的候选数（跨问题融合后） |
 | `FINAL_TOP_K` | `5` | 最终交给模型的上下文条数 |
 | `HF_HOME` | 空 | HuggingFace 缓存根目录；留空使用默认位置 |
 | `RERANKER_OFFLINE_FIRST` | `true` | 优先以本地缓存加载，避免联网校验 |
@@ -277,13 +285,15 @@ pip install --index-url https://download.pytorch.org/whl/cu128 torch
 
 | 事件 | 方向 | 负载 |
 |---|---|---|
-| `sources` | 服务端 → 客户端 | `{"count": int, "sources": [ ... ]}` |
+| `sources` | 服务端 → 客户端 | `{"count": int, "sub_queries": [原问题与子问题], "sources": [ ... ]}` |
 | `thinking` | 服务端 → 客户端 | `{"text": "增量文本"}`，可出现多次 |
 | `token` | 服务端 → 客户端 | `{"text": "增量文本"}`，可出现多次 |
 | `done` | 服务端 → 客户端 | `{"answer_chars": int}` |
 | `error` | 服务端 → 客户端 | `{"message": "错误描述"}` |
 
-`sources` 先于生成下发，客户端可在文本到达前渲染引用列表。思考与答案使用不同事件，
+`sources` 先于生成下发，客户端可在文本到达前渲染"问题拆解"与引用列表。
+每条 source 带 `recalls`（`[{"query_index": int, "branch": "dense"|"sparse"}]`），
+说明该分块被哪个查询（0 号是原问题）以哪种形式召回。思考与答案使用不同事件，
 使前端能够将二者渲染为独立区块，并避免思考内容中的 `[1]` 被误认为引用标记。
 
 响应头包含 `X-Accel-Buffering: no`，用于禁用反向代理的响应缓冲。
@@ -300,9 +310,11 @@ curl -N -X POST http://127.0.0.1:8000/chat \
 
 ```
 event: sources
-data: {"count":2,"sources":[{"doc_id":"…","source":"data/intro.pdf","chunk_index":13,
-      "page":10,"score":0.989556,"score_kind":"rerank","dense_rank":0,"sparse_rank":0,
-      "is_hybrid_hit":true,"snippet":"…","text":"…"}]}
+data: {"count":2,"sub_queries":["混合检索的原理是什么","稠密检索与BM25如何结合","RRF融合公式"],
+      "sources":[{"doc_id":"…","source":"data/intro.pdf","chunk_index":13,
+      "page":10,"score":0.989556,"score_kind":"rerank",
+      "recalls":[{"query_index":0,"branch":"dense"},{"query_index":0,"branch":"sparse"}],
+      "snippet":"…","text":"…"}]}
 
 event: thinking
 data: {"text":"\n分析问题：用户问的是混合检索的原理…"}
@@ -323,7 +335,7 @@ curl -X POST http://127.0.0.1:8000/chat/sync \
 ```
 
 ```json
-{ "answer": "……", "sources": [ { "source": "data/intro.pdf", "page": 10, "score": 0.9896 } ] }
+{ "answer": "……", "sub_queries": ["…"], "sources": [ { "source": "data/intro.pdf", "page": 10, "score": 0.9896 } ] }
 ```
 
 **仅检索**
@@ -335,9 +347,10 @@ curl -X POST http://127.0.0.1:8000/search \
 ```
 
 ```json
-{ "query": "混合检索", "count": 5, "results": [ { "source": "data/intro.pdf", "page": 10,
-  "chunk_index": 13, "score": 0.9896, "score_kind": "rerank",
-  "dense_rank": 0, "sparse_rank": 0, "is_hybrid_hit": true } ] }
+{ "query": "混合检索", "sub_queries": ["混合检索", "…"], "count": 5,
+  "results": [ { "source": "data/intro.pdf", "page": 10, "chunk_index": 13,
+  "score": 0.9896, "score_kind": "rerank",
+  "recalls": [ { "query_index": 0, "branch": "dense" } ] } ] }
 ```
 
 **入库**
@@ -363,8 +376,9 @@ curl http://127.0.0.1:8000/health
 {
   "status": "ok", "version": "0.1.0", "ready": true, "error": null, "warnings": [],
   "milvus": { "collection": "rag_chunks", "server_version": "3.0.2", "chunks": 371 },
-  "retrieval": { "embedding_model": "qwen3-embedding:8b", "dense_top_k": 20,
-                  "sparse_top_k": 20, "rrf_k": 60, "final_top_k": 5 },
+  "retrieval": { "embedding_model": "qwen3-embedding:8b", "fusion_enabled": true,
+                  "fusion_sub_queries": 2, "fusion_recall_k": 15,
+                  "rrf_k": 60, "final_top_k": 5 },
   "reranker": { "enabled": true, "model": "BAAI/bge-reranker-v2-m3",
                  "device": "cpu", "device_configured": "auto" },
   "llm": { "chat_model": "deepseek-r1:14b", "show_thinking": true }
@@ -439,8 +453,9 @@ RRF(d) = Σ 1 / (k + rank_i(d))
 其性质 `2/(k+2) > 1/(k+1)`（任意 `k > 0`）意味着"两路均排第 2"稳定优于"单路排第 1"，
 即在形式上表达了"多路证据一致优于单路极端高分"。
 
-融合在客户端完成（两次检索 + 本地 `fuse`），而非调用 Milvus 的 `hybrid_search`。
-多一次往返换取各分支排名，前端据此标注"双分支命中"并解释排序依据。
+融合在客户端完成（每路查询两次检索 + 本地 `fuse` / `fuse_rankings`），而非调用
+Milvus 的 `hybrid_search`。多一次往返换取各分支与各查询的排名，据此记录每条分块的
+召回溯源（`Hit.recalls`），前端据此标注"被哪个查询以哪种形式召回"。
 
 ### 10.2 中文语料必须配置中文分析器
 

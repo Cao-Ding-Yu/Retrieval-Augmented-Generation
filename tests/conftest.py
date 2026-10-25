@@ -23,8 +23,8 @@ def settings() -> Settings:
     return Settings(
         _env_file=None,
         embedding_dim=1024,
-        dense_top_k=3,
-        sparse_top_k=3,
+        fusion_enabled=False,   # 单元测试不走 LLM 拆解，只用原问题检索
+        fusion_recall_k=3,
         rrf_k=60,
         rerank_top_n=5,
         final_top_k=2,
@@ -84,7 +84,8 @@ class FakeRAG:
         self._thinking = thinking if thinking is not None else []
 
     async def aretrieve(self, question: str):
-        return list(self._hits)
+        # 与 RAG.aretrieve 一致：返回 (命中, 查询列表)，查询[0]是原问题
+        return list(self._hits), [question]
 
     async def astream(self, question: str, hits):
         # 与 RAG.astream 一致：产出 (类型, 文本) 二元组

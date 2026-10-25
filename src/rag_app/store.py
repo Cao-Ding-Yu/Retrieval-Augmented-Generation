@@ -19,7 +19,7 @@ pymilvus 3.x 已弃用 ORM 风格的 ``Collection`` / ``utility`` API（3.1 移�
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 
 from pymilvus import (
     DataType,
@@ -78,16 +78,28 @@ class Hit:
     """
 
     dense_rank: int | None = None
-    """在稠密分支中的名次（0 起）。未命中该分支为 None。"""
+    """在稠密分支中的名次（0 起），随每轮 ``fuse`` 重新赋值。未命中该分支为 None。
+
+    RAG-Fusion 下属于**单轮查询**的中间量：``rag._fusion_retrieve`` 靠它判断
+    该分块以哪种形式被本轮查询召回，转记进 ``recalls``；不随接口输出。
+    """
 
     sparse_rank: int | None = None
-    """在 BM25 分支中的名次（0 起）。未命中该分支为 None。"""
+    """在 BM25 分支中的名次（0 起）。语义同 ``dense_rank``。"""
 
     score_kind: str = "rrf"
     """``score`` 是哪种分数：``"rrf"``（融合分）或 ``"rerank"``（重排分）。
 
     前端靠它决定显示"RRF x.xxxxx"还是"重排 x.xxx"，以及保留几位小数 ——
     RRF 分很小（1/61 ≈ 0.016），重排分在 0~1 之间，两者的有效位数差别很大。
+    """
+
+    recalls: list[tuple[int, str]] = field(default_factory=list)
+    """召回溯源：``(查询序号, 召回形式)`` 列表。
+
+    查询序号对应本次检索的查询列表（0 是原问题，1 起是子问题）；
+    召回形式是 ``"dense"``（语义）或 ``"sparse"``（BM25 关键词）。
+    同一个分块可能被多个问题、以不同形式各召回一次，全部记录。
     """
 
     @property
@@ -104,9 +116,9 @@ class Hit:
             "page": self.page,
             "score": round(self.score, 6),
             "score_kind": self.score_kind,
-            "dense_rank": self.dense_rank,
-            "sparse_rank": self.sparse_rank,
-            "is_hybrid_hit": self.is_hybrid_hit,
+            # 召回溯源是多查询语境下的完整依据；
+            # dense_rank/sparse_rank 只反映单轮查询，不随接口输出
+            "recalls": [{"query_index": qi, "branch": b} for qi, b in self.recalls],
             # snippet 用于折叠态预览，text 用于展开态看全文。
             # 只发 snippet 的话"展开"就成了空操作 —— 前端两个状态会显示同一段截断文字。
             "snippet": self.text[:280] + ("…" if len(self.text) > 280 else ""),
@@ -171,6 +183,42 @@ def fuse(dense: list[Hit], sparse: list[Hit], k: int = 60) -> list[Hit]:
     # 分数相同时按"最佳名次"再按 id 排，保证结果可复现
     fused.sort(key=lambda h: (-h.score, min(ranks[h.id].values()), h.id))
     return fused
+
+
+def fuse_rankings(rankings: list[list[Hit]], k: int = 60) -> list[Hit]:
+    """跨问题 RRF（RAG-Fusion 的第二层融合）。
+
+    :func:`fuse` 融合的是**同一个查询**的两个分支；本函数融合的是**多个查询**
+    各自融合出的完整排序：一个问题把某分块排得越靠前，该分块的总分越高。
+
+    每条命中的 ``recalls`` 会在合并时累积 —— 它记录了"被哪些问题、
+    分别以哪种形式召回"，是前端溯源展示的数据来源。
+
+    Args:
+        rankings: 每个查询融合后的命中列表（各自按相关性降序）。
+        k: RRF 平滑常数。
+
+    Returns:
+        按跨问题 RRF 分数降序的命中列表。
+    """
+    if k <= 0:
+        raise ValueError(f"RRF 常数 k 必须为正数，当前为 {k}")
+
+    scores: dict[str, float] = {}
+    by_id: dict[str, Hit] = {}
+
+    for ranking in rankings:
+        for position, hit in enumerate(ranking):
+            scores[hit.id] = scores.get(hit.id, 0.0) + 1.0 / (k + position + 1)
+            existing = by_id.get(hit.id)
+            if existing is None:
+                by_id[hit.id] = hit
+            else:
+                existing.recalls += hit.recalls  # 同一分块被多个问题召回，溯源累积
+
+    merged = [replace(by_id[doc_id], score=score) for doc_id, score in scores.items()]
+    merged.sort(key=lambda h: (-h.score, h.id))
+    return merged
 
 
 class MilvusStore:

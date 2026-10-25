@@ -1,7 +1,9 @@
 """
-主流程：检索 → 重排 → 组装提示词 → 流式生成
+主流程（RAG-Fusion）：查询拆解 → 多路召回 → 两层 RRF 融合 → 重排 → 流式生成
 
-    api.py  →  RAG.aretrieve()  →  store.dense_search / sparse_search / fuse
+    api.py  →  RAG.aretrieve()  →  _generate_sub_queries()  （LLM 改写子问题）
+                                →  store.dense_search / sparse_search / fuse
+                                →  store.fuse_rankings    （跨问题融合）
             →  RAG.astream()    →  llm.astream
 """
 
@@ -10,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
@@ -18,7 +21,7 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 from langchain_ollama import ChatOllama, OllamaEmbeddings
 
 from rag_app.config import Settings
-from rag_app.store import Hit, MilvusStore, fuse
+from rag_app.store import Hit, MilvusStore, fuse, fuse_rankings
 
 logger = logging.getLogger(__name__)
 
@@ -35,6 +38,16 @@ NO_CONTEXT_REPLY = (
     "我在当前知识库中没有检索到与该问题相关的内容。"
     "请换个说法，或先向知识库补充相关文档。"
 )
+
+# 子问题改写提示词
+FUSION_PROMPT = (
+    "针对下面的原问题，改写出 {n} 个用于知识库检索的子问题。\n"
+    "要求：从不同角度拆解，或换一种表述方式；每个子问题独占一行，"
+    "不要编号，不要输出任何解释。\n\n【原问题】\n{question}"
+)
+
+# 去掉子问题行首的编号 / 列表符号（"1. "、"2、"、"-" 等）
+_SUB_QUERY_PREFIX = re.compile(r"^\s*(?:\d+[.、)）]\s*|[-•*]\s*)")
 
 
 # ===========================================================================
@@ -64,6 +77,14 @@ class RAG:
             model=settings.chat_model,
             temperature=settings.temperature,
             reasoning=settings.show_thinking,
+        )
+        # 查询改写用的独立客户端：关闭思考输出 —— 改写子问题不需要推理，
+        # 用主对话客户端会先白等一段思考，检索延迟翻倍。
+        self.query_llm = ChatOllama(
+            base_url=settings.ollama_base_url,
+            model=settings.chat_model,
+            temperature=0.4,
+            reasoning=False,
         )
 
         self._reranker: _Reranker | None = None
@@ -104,33 +125,71 @@ class RAG:
     # ------------------------------------------------------------------
     # 检索 + 重排
     # ------------------------------------------------------------------
-    async def aretrieve(self, question: str) -> list[Hit]:
-        """检索入口"""
-        return await asyncio.to_thread(self.retrieve, question)
+    async def aretrieve(self, question: str) -> tuple[list[Hit], list[str]]:
+        """检索入口，返回 ``(最终命中, 全部查询)``。
 
-    def retrieve(self, question: str) -> list[Hit]:
-        """
-        完整检索：向量化 → 双分支召回 → RRF 融合 → 交叉编码器重排
+        ``全部查询[0]`` 是原问题，其余是 LLM 生成的子问题 ——
+        前端据此展示"问题拆解"，``Hit.recalls`` 里的查询序号指向这个列表。
         """
         question = (question or "").strip()
-        if not question: return list()
+        if not question:
+            return list(), list()
 
-        # 1) 查询向量化
-        vector = self.embedder.embed_query(question)
+        queries = [question]
+        if self.settings.fusion_enabled:
+            queries += await self._generate_sub_queries(question)
 
-        # 2) 两个分支各召回一次
-        dense = self.store.dense_search(vector, self.settings.dense_top_k)
-        sparse = self.store.sparse_search(question, self.settings.sparse_top_k)
+        hits = await asyncio.to_thread(self._fusion_retrieve, queries)
+        return hits, queries
 
-        # 3) 按名次融合（RRF）
-        candidates = fuse(dense, sparse, k=self.settings.rrf_k)
-        if not candidates: return list()
+    async def _generate_sub_queries(self, question: str) -> list[str]:
+        """让 LLM 生成子问题；失败时退回只用原问题，不阻断检索。"""
+        n = self.settings.fusion_sub_queries
+        if n <= 0:
+            return list()
 
-        # 4) 截断到重排预算
-        candidates = candidates[: self.settings.rerank_top_n]
+        try:
+            prompt = FUSION_PROMPT.format(n=n, question=question)
+            response = await self.query_llm.ainvoke([HumanMessage(content=prompt)])
+            subs = _parse_sub_queries(
+                strip_thinking(_chunk_text(response.content)), question, n
+            )
+            logger.info("RAG-Fusion 子问题：%s", subs)
+            return subs
+        except Exception as exc:
+            logger.warning("子问题生成失败，退回单问题检索：%s: %s", type(exc).__name__, exc)
+            return list()
 
-        # 5) 精排后取最终条数
-        return self._rerank(question, candidates)
+    def _fusion_retrieve(self, queries: list[str]) -> list[Hit]:
+        """RAG-Fusion 检索：逐查询双分支召回 → 每查询 RRF → 跨问题 RRF → 重排。
+
+        第一层 RRF（``fuse``）融合同一问题的稠密与 BM25 两个分支；
+        第二层 RRF（``fuse_rankings``）融合多个问题各自的排序 ——
+        一个分块被越多的问题、以越靠前的名次召回，总分越高。
+        """
+        cfg = self.settings
+        recall_k = cfg.fusion_recall_k
+
+        rankings: list[list[Hit]] = []
+        for index, query in enumerate(queries):
+            dense = self.store.dense_search(self.embedder.embed_query(query), recall_k)
+            sparse = self.store.sparse_search(query, recall_k)
+
+            fused = fuse(dense, sparse, k=cfg.rrf_k)[:recall_k]
+            # 记录召回溯源：被本问题以哪种形式召回（0 号查询是原问题）
+            for hit in fused:
+                if hit.dense_rank is not None:
+                    hit.recalls.append((index, "dense"))
+                if hit.sparse_rank is not None:
+                    hit.recalls.append((index, "sparse"))
+            rankings.append(fused)
+
+        candidates = fuse_rankings(rankings, k=cfg.rrf_k)
+        if not candidates:
+            return list()
+
+        # 用原问题（而非子问题）做精排：最终答案要回答的是原问题
+        return self._rerank(queries[0], candidates[: cfg.rerank_top_n])
 
     def _rerank(self, question: str, hits: list[Hit]) -> list[Hit]:
         """用交叉编码器重排，返回前 final_top_k 条"""
@@ -207,8 +266,19 @@ class RAG:
 
 
 # ===========================================================================
-# 提示词
+# 提示词与子问题解析
 # ===========================================================================
+def _parse_sub_queries(text: str, original: str, limit: int) -> list[str]:
+    """从模型输出里提取子问题：去编号、去空行、去重、剔除与原问题相同的行。"""
+    subs: list[str] = []
+    for line in text.splitlines():
+        line = _SUB_QUERY_PREFIX.sub("", line).strip()
+        if not line or line == original or line in subs:
+            continue
+        subs.append(line)
+    return subs[:limit]
+
+
 def build_messages(question: str, hits: list[Hit], max_chars: int) -> list[BaseMessage]:
     """拼成 [System, Human] 两条消息。
 

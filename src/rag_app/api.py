@@ -7,7 +7,7 @@
 
 ``/chat`` 用 Server-Sent Events 逐 token 推流。事件序列::
 
-    event: sources   -> 检索到的引用列表（先发，前端立刻能渲染引用）
+    event: sources   -> 查询拆解（原问题 + 子问题）与引用列表（先发，前端立刻能渲染）
     event: token     -> 文本增量，可能多次
     event: done      -> 正常结束
 
@@ -154,8 +154,9 @@ def _register_routes(app: FastAPI) -> None:
             },
             "retrieval": {
                 "embedding_model": cfg.embedding_model,
-                "dense_top_k": cfg.dense_top_k,
-                "sparse_top_k": cfg.sparse_top_k,
+                "fusion_enabled": cfg.fusion_enabled,
+                "fusion_sub_queries": cfg.fusion_sub_queries,
+                "fusion_recall_k": cfg.fusion_recall_k,
                 "rrf_k": cfg.rrf_k,
                 "final_top_k": cfg.final_top_k,
             },
@@ -176,11 +177,11 @@ def _register_routes(app: FastAPI) -> None:
     # ---------------------------------------------------------------- 对话（SSE）
     @app.post("/chat", tags=["chat"])
     async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
-        """流式对话：先推引用，再推思考（可选），最后逐 token 推答案。
+        """流式对话：先推查询拆解与引用，再推思考（可选），最后逐 token 推答案。
 
         事件序列::
 
-            sources  -> 引用列表
+            sources  -> 查询拆解（原问题 + 子问题）与引用列表
             thinking -> 思考过程增量（仅 SHOW_THINKING=true 时发送，可多次）
             token    -> 答案增量（多次）
             done     -> 结束
@@ -192,12 +193,13 @@ def _register_routes(app: FastAPI) -> None:
 
         async def stream() -> AsyncIterator[str]:
             try:
-                # 1) 检索
-                hits = await rag.aretrieve(payload.message)
+                # 1) RAG-Fusion 检索：queries[0] 是原问题，其余是子问题
+                hits, queries = await rag.aretrieve(payload.message)
 
                 if payload.include_sources:
                     yield _sse("sources", {
                         "count": len(hits),
+                        "sub_queries": queries,
                         "sources": [h.to_dict() for h in hits],
                     })
 
@@ -234,12 +236,16 @@ def _register_routes(app: FastAPI) -> None:
         """一次性返回完整答案，便于脚本与自动化测试。"""
         rag = get_rag(request)
 
-        hits = await rag.aretrieve(payload.message)
+        hits, queries = await rag.aretrieve(payload.message)
         if not hits:
-            return {"answer": NO_CONTEXT_REPLY, "sources": []}
+            return {"answer": NO_CONTEXT_REPLY, "sub_queries": queries, "sources": []}
 
         answer = await rag.answer(payload.message, hits)
-        return {"answer": answer, "sources": [h.to_dict() for h in hits]}
+        return {
+            "answer": answer,
+            "sub_queries": queries,
+            "sources": [h.to_dict() for h in hits],
+        }
 
     # ---------------------------------------------------------------- 纯检索
     @app.post("/search", tags=["chat"])
@@ -251,9 +257,10 @@ def _register_routes(app: FastAPI) -> None:
         """
         rag = get_rag(request)
 
-        hits = await rag.aretrieve(payload.query)
+        hits, queries = await rag.aretrieve(payload.query)
         return {
             "query": payload.query,
+            "sub_queries": queries,
             "count": len(hits),
             "results": [h.to_dict() for h in hits],
         }

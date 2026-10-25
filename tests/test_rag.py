@@ -14,6 +14,7 @@ from rag_app.rag import (
     NO_CONTEXT_REPLY,
     RAG,
     ThinkingStripper,
+    _parse_sub_queries,
     build_messages,
     format_context,
     resolve_device,
@@ -25,6 +26,38 @@ from tests.conftest import make_hit
 LT, GT = chr(60), chr(62)
 OPEN = LT + "think" + GT
 CLOSE = LT + "/think" + GT
+
+
+# ---------------------------------------------------------------------------
+# 子问题解析
+# ---------------------------------------------------------------------------
+class TestParseSubQueries:
+    def test_reads_plain_lines(self):
+        text = "什么是RAG-Fusion\nRRF融合的原理是什么"
+        assert _parse_sub_queries(text, "介绍RAG", 2) == [
+            "什么是RAG-Fusion", "RRF融合的原理是什么",
+        ]
+
+    def test_strips_numbering_and_bullets(self):
+        text = "1. 第一个子问题\n2、第二个子问题\n- 第三个子问题"
+        result = _parse_sub_queries(text, "原问题", 3)
+
+        assert result[0] == "第一个子问题"
+        assert result[1] == "第二个子问题"
+        assert result[2] == "第三个子问题"
+
+    def test_skips_blank_duplicate_and_original_lines(self):
+        text = "\n重复\n重复\n原问题\n新的问题"
+        assert _parse_sub_queries(text, "原问题", 5) == ["重复", "新的问题"]
+
+    def test_limit_is_applied(self):
+        text = "甲\n乙\n丙\n丁"
+        assert _parse_sub_queries(text, "原", 2) == ["甲", "乙"]
+
+    def test_thinking_only_output_yields_nothing(self):
+        """推理模型只吐思考块时（先剥离，再解析），结果为空 —— 调用方会退回单问题检索。"""
+        raw = f"{OPEN}让我想想…{CLOSE}"
+        assert _parse_sub_queries(strip_thinking(raw), "原问题", 2) == []
 
 
 # ---------------------------------------------------------------------------

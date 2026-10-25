@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import pytest
 
-from rag_app.store import _to_hits, fuse
+from rag_app.store import _to_hits, fuse, fuse_rankings
 from tests.conftest import make_hit
 
 
@@ -172,3 +172,45 @@ class TestPagePropagation:
         }}]]
 
         assert _to_hits(rows)[0].page is None
+
+
+class TestFuseRankings:
+    """跨问题融合（RAG-Fusion 第二层 RRF）。"""
+
+    def test_scores_match_manual_calculation(self):
+        # a 被两个问题都排第 1：2/(60+1)；b 只被问题 2 排第 2：1/(60+2)
+        r1 = [make_hit("a"), make_hit("x")]
+        r2 = [make_hit("a"), make_hit("b")]
+
+        scores = {h.id: h.score for h in fuse_rankings([r1, r2], k=60)}
+
+        assert scores["a"] == pytest.approx(2 / 61)
+        assert scores["b"] == pytest.approx(1 / 62)
+
+    def test_recall_traces_from_all_rankings_are_merged(self):
+        """同一分块被多个问题召回时，溯源记录要全部累积。"""
+        r1 = [make_hit("a")]
+        r1[0].recalls = [(0, "dense")]
+        r2 = [make_hit("a")]
+        r2[0].recalls = [(1, "sparse"), (1, "dense")]
+
+        merged = fuse_rankings([r1, r2], k=60)
+
+        assert merged[0].recalls == [(0, "dense"), (1, "sparse"), (1, "dense")]
+
+    def test_recall_trace_survives_first_ranking_only_hit(self):
+        """只出现在一个排序里的分块，溯源原样保留。"""
+        r1 = [make_hit("a"), make_hit("b")]
+        r1[1].recalls = [(0, "sparse")]
+
+        merged = fuse_rankings([r1], k=60)
+        by_id = {h.id: h for h in merged}
+
+        assert by_id["b"].recalls == [(0, "sparse")]
+
+    def test_empty_input(self):
+        assert fuse_rankings([], k=60) == []
+
+    def test_invalid_k_raises(self):
+        with pytest.raises(ValueError):
+            fuse_rankings([[make_hit("a")]], k=0)

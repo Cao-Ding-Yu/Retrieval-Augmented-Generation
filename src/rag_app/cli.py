@@ -76,28 +76,28 @@ async def _cmd_ingest(rag: RAG, args: argparse.Namespace) -> int:
 
 
 async def _cmd_search(rag: RAG, args: argparse.Namespace) -> int:
-    """只跑检索，打印打分明细（不调用生成模型）。"""
-    hits = await rag.aretrieve(args.query)
+    """只跑检索，打印查询拆解与打分明细（不调用生成模型）。"""
+    hits, queries = await rag.aretrieve(args.query)
 
-    print(f"\n查询：{args.query}")
+    print(f"\n原问题：{args.query}")
+    if len(queries) > 1:
+        print("子问题：")
+        for i, q in enumerate(queries[1:], start=1):
+            print(f"  子问题{i}：{q}")
     print(f"命中：{len(hits)} 条\n")
     if not hits:
         print("（无命中）若知识库为空，请先执行 ingest 子命令。")
         return 0
 
     for rank, hit in enumerate(hits, start=1):
-        # 分支名次能直接看出这条是语义命中的还是关键词命中的
-        branches = []
-        if hit.dense_rank is not None:
-            branches.append(f"稠密#{hit.dense_rank + 1}")
-        if hit.sparse_rank is not None:
-            branches.append(f"稀疏#{hit.sparse_rank + 1}")
-
         where = f"第 {hit.page} 页" if hit.page else f"第 {hit.chunk_index + 1} 块"
         print(f"[{rank}] {hit.source}  {where}")
-        print(f"    命中分支: {' + '.join(branches) or '-'}   分数: {hit.score:.4f}")
-        if hit.is_hybrid_hit:
-            print("    ★ 语义与关键词同时命中")
+        # 溯源：每个问题以哪种形式召回了这条分块
+        for query_index, branch in hit.recalls:
+            label = "原问题" if query_index == 0 else f"子问题{query_index}"
+            form = "语义" if branch == "dense" else "关键词"
+            print(f"    召回: {label} · {form}")
+        print(f"    分数: {hit.score:.4f} ({hit.score_kind})")
         preview = hit.text[:160].replace("\n", " ")
         print(f"    内容: {preview}{'…' if len(hit.text) > 160 else ''}\n")
 
@@ -117,8 +117,9 @@ def _cmd_stats(rag: RAG) -> int:
         "对话模型": cfg.chat_model,
         "重排": "开" if rag.rerank_enabled else "关",
         "重排模型": cfg.reranker_model if rag.rerank_enabled else "（未启用）",
-        "dense_top_k": cfg.dense_top_k,
-        "sparse_top_k": cfg.sparse_top_k,
+        "fusion_enabled": cfg.fusion_enabled,
+        "fusion_sub_queries": cfg.fusion_sub_queries,
+        "fusion_recall_k": cfg.fusion_recall_k,
         "rrf_k": cfg.rrf_k,
         "final_top_k": cfg.final_top_k,
     }

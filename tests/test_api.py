@@ -135,9 +135,10 @@ class TestChatStream:
 
         assert "".join(tokens) == "混合检索很好"
 
-    def test_sources_carry_ranking_detail(self, settings):
+    def test_sources_carry_recall_traces(self, settings):
+        """召回溯源随 sources 事件下发：前端靠它展示"被哪个查询以哪种形式召回"。"""
         hit = make_hit("k1", source="manual.pdf", chunk_index=3)
-        hit.dense_rank, hit.sparse_rank = 0, 2
+        hit.recalls = [(0, "dense"), (0, "sparse"), (2, "sparse")]
         client = build_client(settings, FakeRAG(settings, hits=[hit]))
 
         events = parse_sse(client.post("/chat", json={"message": "问题"}).text)
@@ -145,7 +146,11 @@ class TestChatStream:
 
         assert sources["count"] == 1
         entry = sources["sources"][0]
-        assert entry["is_hybrid_hit"] is True
+        assert entry["recalls"] == [
+            {"query_index": 0, "branch": "dense"},
+            {"query_index": 0, "branch": "sparse"},
+            {"query_index": 2, "branch": "sparse"},
+        ]
         assert entry["source"] == "manual.pdf"
         assert entry["chunk_index"] == 3
 
@@ -240,16 +245,19 @@ class TestChatSync:
 
 
 class TestSearch:
-    def test_returns_ranking_detail(self, settings):
+    def test_returns_sub_queries_and_recalls(self, settings):
+        """/search 返回查询拆解与召回溯源，便于在不生成答案的情况下调试检索。"""
         hit = make_hit("k1")
-        hit.dense_rank, hit.sparse_rank = 1, None
+        hit.recalls = [(1, "dense")]
         client = build_client(settings, FakeRAG(settings, hits=[hit]))
 
         body = client.post("/search", json={"query": "查询"}).json()
 
         assert body["count"] == 1
-        assert body["results"][0]["dense_rank"] == 1
-        assert body["results"][0]["is_hybrid_hit"] is False
+        assert body["sub_queries"] == ["查询"]     # FakeRAG 只回传原问题
+        assert body["results"][0]["recalls"] == [
+            {"query_index": 1, "branch": "dense"},
+        ]
 
 
 # ---------------------------------------------------------------------------

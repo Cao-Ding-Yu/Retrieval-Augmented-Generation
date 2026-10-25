@@ -36,10 +36,16 @@ class Settings(BaseSettings):
     milvus_token: str = ""
     milvus_collection: str = "rag_chunks"
 
-    # ---- 检索 ----
-    dense_top_k: int = Field(default=20, ge=1)
-    sparse_top_k: int = Field(default=20, ge=1)
+    # ---- 检索（RAG-Fusion）----
+    fusion_enabled: bool = True
+    """是否启用 RAG-Fusion：先用 LLM 把原问题改写成子问题，再多路召回后融合。"""
+    fusion_sub_queries: int = Field(default=2, ge=0)
+    """额外生成的子问题数。原问题始终保留，总查询数 = 1 + fusion_sub_queries。"""
+    fusion_recall_k: int = Field(default=15, ge=1)
+    """每个问题（含原问题）召回并保留的分块数：稠密、BM25 各查 fusion_recall_k 条，
+    融合后截断到 fusion_recall_k 条参与跨问题融合。"""
     rrf_k: int = Field(default=60, ge=1)
+    """RRF 平滑常数，两层融合（分支内、跨问题）共用。"""
     bm25_analyzer_type: str = "chinese"
 
     # ---- 重排 ----
@@ -52,7 +58,7 @@ class Settings(BaseSettings):
     注意：即使选了 ``cuda``，也需要装的是 **CUDA 版 torch** ——
     纯 CPU 轮子（``x.y.z+cpu``）里 ``torch.cuda.is_available()`` 恒为 False。
     """
-    rerank_top_n: int = Field(default=30, ge=1)
+    rerank_top_n: int = Field(default=20, ge=1)
     final_top_k: int = Field(default=5, ge=1)
     hf_home: str = ""
     reranker_offline_first: bool = True

@@ -193,6 +193,27 @@
     font-size: 11px; color: var(--text-faint);
     text-transform: uppercase; letter-spacing: .06em;
   }
+
+  /* ==================== 问题拆解（RAG-Fusion）====================
+     展示本次检索用了哪些查询：原问题 + LLM 拆解出的子问题。 */
+  .plan {
+    display: flex; flex-direction: column; gap: 4px;
+    margin: 4px 0 12px;
+  }
+  .plan-item {
+    display: flex; align-items: baseline; gap: 8px;
+    background: var(--bg-input); border: 1px solid var(--border);
+    border-radius: 8px; padding: 6px 10px; font-size: 12.5px;
+  }
+  .plan-label {
+    font-family: var(--mono); font-size: 11px; flex-shrink: 0;
+    color: var(--text-faint); letter-spacing: .04em;
+  }
+  .plan-item.original .plan-label { color: var(--accent); }
+  .plan-text { color: var(--text-dim); overflow-wrap: anywhere; }
+  .plan-item.original .plan-text { color: var(--text); }
+
+  /* 召回溯源徽章：这条分块被哪个查询、以哪种形式召回，与定位信息同排 */
   .source {
     background: var(--bg-input); border: 1px solid var(--border);
     border-radius: 8px; padding: 8px 12px; font-size: 12.5px;
@@ -225,16 +246,14 @@
   /* 展开时给卡片一点视觉区分，便于看出当前展开的是哪一条 */
   .source.expanded { border-color: #3a4256; background: #1b1f29; }
 
-  /* 打分徽章：用颜色区分"双分支命中"与"单分支命中" */
+  /* 召回徽章：颜色区分召回形式 —— 绿=混合（双分支）、紫=语义、黄=关键词 */
   .badge {
     font-size: 10px; padding: 1px 6px; border-radius: 4px;
     font-family: var(--mono);
   }
   .badge.hybrid { background: #1b3a2c; color: var(--success); }
-  .badge.dense  { background: #20293f; color: #7ba0ff; }
+  .badge.dense  { background: #2b2342; color: #c3adff; }
   .badge.sparse { background: #3a3120; color: var(--warn); }
-  /* 服务端融合下拿不到分支名次，用中性徽章，避免被误标成"语义命中" */
-  .badge.fused  { background: #262a35; color: var(--text-dim); }
 
   /* "回到最新"悬浮按钮：用户往上翻看历史内容时出现。
      没有它的话，流式输出期间用户滚上去就看不懂"为什么又跳回底部了"。 */
@@ -312,10 +331,11 @@
       <div class="msg">
         <div class="role">系统</div>
         <div class="bubble">
-          <p>已就绪。提问后系统会执行：<strong>查询向量化</strong> →
-          <strong>稠密检索 + BM25 词法检索</strong> → <strong>RRF 融合</strong> →
-          <strong>交叉编码器重排</strong> → <strong>流式生成</strong>。</p>
-          <p>回答下方的引用卡片可以点击展开，查看该分块的完整内容与排序依据。</p>
+          <p>已就绪。提问后系统会执行：<strong>问题拆解（RAG-Fusion）</strong> →
+          <strong>多路召回（每个问题 稠密 + BM25 各 15 条）</strong> →
+          <strong>两层 RRF 融合</strong> → <strong>交叉编码器重排</strong> → <strong>流式生成</strong>。</p>
+          <p>回答下方会先展示原问题与拆解出的子问题；引用卡片可点击展开，
+          并能看到每个分块分别被哪些查询、以哪种形式召回。</p>
         </div>
       </div>
     </div>
@@ -510,6 +530,10 @@ async function refreshHealth() {
     const items = [
       { label: "稠密检索", on: true },
       { label: "BM25 词法检索", on: true },
+      { label: h.retrieval.fusion_enabled
+          ? `RAG-Fusion ×${(h.retrieval.fusion_sub_queries || 0) + 1} 路查询`
+          : "RAG-Fusion 未启用",
+        on: h.retrieval.fusion_enabled === true },
       { label: `RRF k=${h.retrieval.rrf_k}`, on: true },
       { label: rrLabel, on: rrEnabled },
       { label: h.llm.chat_model, on: true },
@@ -614,8 +638,43 @@ function showError(message) {
 }
 
 /**
+ * 渲染"问题拆解"：原问题 + LLM 拆解出的子问题。
+ * sub_queries[0] 是原问题，其余是子问题；每个条目对应一路检索。
+ */
+function renderPlan(container, queries) {
+  if (!queries || !queries.length) return;
+
+  const items = queries.map((q, i) => `
+    <div class="plan-item${i === 0 ? " original" : ""}">
+      <span class="plan-label">${i === 0 ? "原问题" : "子问题" + i}</span>
+      <span class="plan-text">${escapeHtml(q)}</span>
+    </div>`).join("");
+
+  container.insertAdjacentHTML("afterbegin",
+    `<div class="sources-title">问题拆解（${queries.length} 路查询）</div>
+     <div class="plan">${items}</div>`);
+}
+
+/** 召回溯源徽章：按查询分组 —— 同一问题双分支召回只显示一枚"混合"徽章。 */
+function recallChips(recalls) {
+  const byQuery = new Map();   // query_index -> 命中的形式集合；插入序 = 查询序
+  for (const r of recalls || []) {
+    if (!byQuery.has(r.query_index)) byQuery.set(r.query_index, new Set());
+    byQuery.get(r.query_index).add(r.branch);
+  }
+
+  return [...byQuery].map(([queryIndex, forms]) => {
+    const label = queryIndex === 0 ? "原问题" : "子问题" + queryIndex;
+    const mixed = forms.has("dense") && forms.has("sparse");
+    const text = mixed ? "混合召回" : (forms.has("dense") ? "语义召回" : "关键词召回");
+    const cls = mixed ? "hybrid" : (forms.has("dense") ? "dense" : "sparse");
+    return `<span class="badge ${cls}">${label}·${text}</span>`;
+  }).join("");
+}
+
+/**
  * 渲染引用卡片。
- * 分数与命中分支都展示出来，让"为什么这条被选中"可被检验——
+ * 分数、召回溯源都展示出来，让"为什么这条被选中"可被检验——
  * 这是检索系统可解释性的最小实现。
  */
 function renderSources(container, sources) {
@@ -627,22 +686,6 @@ function renderSources(container, sources) {
   const head = `<div class="sources-title">检索到 ${sources.length} 条上下文</div>`;
 
   const cards = sources.map((s, i) => {
-    // 命中分支决定徽章：
-    //   双分支命中 = 语义与关键词都命中（最强信号）
-    //   仅稀疏命中 = 关键词命中
-    //   仅稠密命中 = 语义命中
-    const hasDenseRank = s.dense_rank !== null && s.dense_rank !== undefined;
-    const hasSparseRank = s.sparse_rank !== null && s.sparse_rank !== undefined;
-
-    let badgeClass = "fused", badgeText = "未知来源";
-    if (s.is_hybrid_hit) {
-      badgeClass = "hybrid"; badgeText = "双分支命中";
-    } else if (hasSparseRank) {
-      badgeClass = "sparse"; badgeText = "关键词命中";
-    } else if (hasDenseRank) {
-      badgeClass = "dense"; badgeText = "语义命中";
-    }
-
     // 分数：后端只给一个 score + score_kind 标明它是哪种分。
     // 两者有效位数差别很大 —— RRF 分约 0.016，重排分在 0~1 之间。
     const scoreText = (s.score !== null && s.score !== undefined)
@@ -651,15 +694,14 @@ function renderSources(container, sources) {
           : `RRF ${Number(s.score).toFixed(5)}`)
       : "";
 
-    const rankParts = [];
-    if (hasDenseRank) rankParts.push(`稠密#${s.dense_rank + 1}`);
-    if (hasSparseRank) rankParts.push(`稀疏#${s.sparse_rank + 1}`);
-
     // 定位信息：PDF 显示页码（用户真正关心的），其它格式显示第几个分块。
     // chunk_index 是"该文件内第几块"，和 PDF 页码不是一回事。
     const locator = (s.page !== null && s.page !== undefined)
       ? `第 ${s.page} 页`
       : `第 ${(s.chunk_index ?? 0) + 1} 块`;
+
+    // 召回溯源：每个"哪个问题·哪种形式"一枚徽章，与定位信息同排展示
+    const chips = recallChips(s.recalls);
 
     return `
       <div class="source" data-idx="${i}">
@@ -667,9 +709,8 @@ function renderSources(container, sources) {
           <span class="src-idx">[${i + 1}]</span>
           <span class="src-name">${escapeHtml(s.source || "未知来源")}</span>
           <span class="src-meta">${escapeHtml(locator)}</span>
-          <span class="badge ${badgeClass}">${badgeText}</span>
+          ${chips}
           ${scoreText ? `<span class="src-meta">${escapeHtml(scoreText)}</span>` : ""}
-          ${rankParts.length ? `<span class="src-meta">${escapeHtml(rankParts.join(" · "))}</span>` : ""}
         </div>
         <div class="src-snippet">${escapeHtml(s.snippet || "")}</div>
         <div class="src-full">${escapeHtml(s.text || s.snippet || "")}</div>
@@ -802,6 +843,7 @@ async function ask(question) {
 
         if (event === "sources") {
           renderSources(sourcesEl, data.sources);
+          renderPlan(sourcesEl, data.sub_queries);   // 插到引用区前面
           // 引用卡片会撑高内容；贴底时要跟上，否则用户看着"卡"在半路
           if (stickToBottom) scrollToBottom();
         } else if (event === "thinking") {
