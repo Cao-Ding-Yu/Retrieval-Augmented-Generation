@@ -387,7 +387,7 @@ class _Reranker:
 
 
 def resolve_device(preference: str) -> str:
-    """把 ``RERANKER_DEVICE`` 解析成实际可用的设备名。
+    """把 ``RERANKER_DEVICE`` 解析成实际可用的设备名
 
     ``auto`` 的优先级：CUDA → Apple MPS → CPU。
 
@@ -485,7 +485,7 @@ def _resolve_snapshot_dir(model_name: str) -> Path | None:
 # 思考块剥离
 # ===========================================================================
 class ThinkingStripper:
-    """剥离推理模型的思考块，**支持流式**输入。
+    """剥离推理模型的思考块，**支持流式**输入
 
     ## 为什么不能用正则
 
@@ -543,7 +543,7 @@ class ThinkingStripper:
         return "".join(answer), "".join(thinking)
 
     def flush(self) -> tuple[str, str]:
-        """流结束时调用，返回剩余内容 ``(正文, 思考)``。
+        """流结束时调用，返回剩余内容 ``(正文, 思考)``
 
         未闭合的思考块（模型被截断）仍归入思考部分 —— 它是推理过程，
         不能混进答案，但拿来展示是合适的。
@@ -564,7 +564,7 @@ def strip_thinking(text: str) -> str:
 
 
 def _chunk_text(content: Any) -> str:
-    """从消息内容里抽取纯文本（兼容 str 与内容块列表两种形态）。"""
+    """从消息内容里抽取纯文本（兼容 str 与内容块列表两种形态）"""
     if isinstance(content, str):
         return content
     if isinstance(content, list):

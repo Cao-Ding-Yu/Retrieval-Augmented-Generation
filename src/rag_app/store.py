@@ -1,4 +1,4 @@
-"""Milvus 存储层：建表、写入、两路检索、RRF 融合。
+"""Milvus 存储层：建表、写入、两路检索、RRF 融合
 
 这是唯一直接接触 Milvus 的文件。上层（``rag.py``）只需要三个方法：
 ``dense_search`` / ``sparse_search`` / ``insert``，不需要知道 Milvus 的任何细节。
