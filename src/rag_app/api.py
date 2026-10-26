@@ -1,7 +1,7 @@
-"""HTTP 接口层：应用装配 + 所有路由。
+"""
+HTTP 接口层：应用装配 + 所有路由
 
-整个 HTTP 面只有一个文件，从上到下依次是：应用创建 → 依赖检查 → 各接口。
-路由内部不再经过额外的依赖容器，直接调 ``app.state.rag``（一个 RAG 实例）。
+应用创建 → 依赖检查 → 各接口
 
 ## 关于 SSE
 
@@ -11,8 +11,7 @@
     event: token     -> 文本增量，可能多次
     event: done      -> 正常结束
 
-出错时发 ``event: error`` —— 此时响应头早已发出，改不了 HTTP 状态码，
-只能靠事件类型告知前端。
+出错时发 ``event: error``
 """
 
 from __future__ import annotations
@@ -38,8 +37,7 @@ logger = logging.getLogger(__name__)
 # 仓库根目录下的前端静态资源
 WEB_DIR = Path(__file__).resolve().parents[2] / "web"
 
-# SSE 响应头：必须禁用代理缓冲，否则 token 会被攒起来一次性下发，
-# 流式效果完全消失（这是"线上流式不生效"最常见的原因）
+# SSE 响应头：必须禁用代理缓冲
 SSE_HEADERS = {
     "Cache-Control": "no-cache, no-transform",
     "Connection": "keep-alive",
@@ -69,10 +67,10 @@ class IngestPathRequest(BaseModel):
 # ===========================================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """启动时创建 RAG 并连接依赖，关闭时释放。
+    """
+    启动时创建 RAG 并连接依赖，关闭时释放
 
-    所有重量级资源（Milvus 连接、2GB 的重排模型）都在这里创建一次 ——
-    不是模块导入时（会污染 import），也不是每个请求（重排模型每次加载要几秒）。
+    所有重量级资源（Milvus 连接、2GB 的重排模型）都在这里创建一次
     """
     settings = app.state.settings
     rag = RAG(settings)
@@ -82,8 +80,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     try:
         rag.start()
     except Exception as exc:
-        # 启动失败也照常提供服务：让 /health 能报告原因，
-        # 而不是让用户面对一个连不上的端口。
+        # 启动失败也照常提供服务：让 /health 能报告原因
         app.state.startup_error = f"初始化失败：{exc}"
         logger.exception("初始化失败，检索功能不可用")
 
@@ -92,7 +89,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
-    """构造 FastAPI 应用。"""
+    """构造 FastAPI 应用"""
     settings = settings or get_settings()
 
     app = FastAPI(
@@ -117,10 +114,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 # 路由
 # ===========================================================================
 def _register_routes(app: FastAPI) -> None:
-    """把接口挂到 app 上。全部路由集中在这里，便于一眼看全 HTTP 面。"""
+    """全部路由"""
 
     def get_rag(request: Request) -> RAG:
-        """取出 RAG 实例；未就绪时返回 503 并带上初始化失败的原因。"""
+        """取出 RAG 实例；未就绪时返回 503 并带上初始化失败的原因"""
         rag: RAG | None = getattr(request.app.state, "rag", None)
         error = getattr(request.app.state, "startup_error", None)
         if rag is None or error:
@@ -133,12 +130,11 @@ def _register_routes(app: FastAPI) -> None:
     # ---------------------------------------------------------------- 健康
     @app.get("/health", tags=["ops"])
     async def health(request: Request) -> JSONResponse:
-        """返回服务状态、降级原因与当前生效的检索配置。"""
+        """返回服务状态、降级原因与当前生效的检索配置"""
         rag: RAG | None = getattr(request.app.state, "rag", None)
         error = getattr(request.app.state, "startup_error", None)
         cfg = request.app.state.settings
 
-        # warnings 会显示在前端顶部的告警条里，所以必须是可读的中文原因
         warnings = [rag.rerank_warning] if (rag and rag.rerank_warning) else []
 
         return JSONResponse({
@@ -163,8 +159,6 @@ def _register_routes(app: FastAPI) -> None:
             "reranker": {
                 "enabled": bool(rag and rag.rerank_enabled),
                 "model": cfg.reranker_model,
-                # 实际加载到的设备。configured 是配置值，device 是真实结果 ——
-                # 两者不一致（例如配了 cuda 却回退 cpu）时能一眼看出来。
                 "device": rag.rerank_device if rag else None,
                 "device_configured": cfg.reranker_device,
             },
@@ -177,7 +171,8 @@ def _register_routes(app: FastAPI) -> None:
     # ---------------------------------------------------------------- 对话（SSE）
     @app.post("/chat", tags=["chat"])
     async def chat(payload: ChatRequest, request: Request) -> StreamingResponse:
-        """流式对话：先推查询拆解与引用，再推思考（可选），最后逐 token 推答案。
+        """
+        流式对话：先推查询拆解与引用，再推思考（可选），最后逐 token 推答案
 
         事件序列::
 
@@ -233,7 +228,7 @@ def _register_routes(app: FastAPI) -> None:
     # ---------------------------------------------------------------- 对话（非流式）
     @app.post("/chat/sync", tags=["chat"])
     async def chat_sync(payload: ChatRequest, request: Request) -> dict:
-        """一次性返回完整答案，便于脚本与自动化测试。"""
+        """一次性返回完整答案，便于脚本与自动化测试"""
         rag = get_rag(request)
 
         hits, queries = await rag.aretrieve(payload.message)
@@ -250,11 +245,7 @@ def _register_routes(app: FastAPI) -> None:
     # ---------------------------------------------------------------- 纯检索
     @app.post("/search", tags=["chat"])
     async def search(payload: SearchRequest, request: Request) -> dict:
-        """只检索不生成。排查"答案不对"时先看这里：
-
-        这里的结果就不相关 → 问题在检索（分块/嵌入/融合/重排）；
-        这里对但答案不对 → 问题在提示词或生成模型。
-        """
+        """只检索不生成"""
         rag = get_rag(request)
 
         hits, queries = await rag.aretrieve(payload.query)
@@ -268,10 +259,7 @@ def _register_routes(app: FastAPI) -> None:
     # ---------------------------------------------------------------- 入库
     @app.post("/ingest", tags=["ingest"])
     async def ingest_path(payload: IngestPathRequest, request: Request) -> dict:
-        """把服务端某个路径导入知识库。目录会递归处理。
-
-        同一文件重复入库是幂等的（按 doc_id 先删后插）。
-        """
+        """把服务端某个路径导入知识库"""
         rag = get_rag(request)
 
         target = Path(payload.path)
@@ -283,7 +271,7 @@ def _register_routes(app: FastAPI) -> None:
 
     @app.post("/ingest/upload", tags=["ingest"])
     async def ingest_upload(file: UploadFile, request: Request) -> dict:
-        """上传文件后入库。落盘再解析，便于事后排查问题文件。"""
+        """上传文件后入库。落盘再解析，便于事后排查问题文件"""
         rag = get_rag(request)
 
         if not file.filename:
@@ -307,7 +295,7 @@ def _register_routes(app: FastAPI) -> None:
     # ---------------------------------------------------------------- 概况
     @app.get("/stats", tags=["ingest"])
     async def stats(request: Request) -> dict:
-        """知识库规模与当前生效的检索配置。"""
+        """知识库规模与当前生效的检索配置"""
         rag = get_rag(request)
         cfg = rag.settings
         return {
@@ -324,10 +312,6 @@ def _register_routes(app: FastAPI) -> None:
 # SSE 工具
 # ===========================================================================
 def _sse(event: str, payload: object) -> str:
-    """编码一个 SSE 帧。
-
-    ``ensure_ascii=False`` 是刻意的：中文直接以 UTF-8 输出而不是 \\uXXXX 转义，
-    响应体积能小约 3 倍，curl 调试时也肉眼可读。
-    """
+    """编码一个 SSE 帧"""
     data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     return f"event: {event}\ndata: {data}\n\n"

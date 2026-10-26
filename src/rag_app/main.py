@@ -24,8 +24,8 @@ def main() -> None:
     logger.info("  嵌入模型 : %s (dim=%d)", settings.embedding_model, settings.embedding_dim)
     logger.info("  Milvus   : %s / %s", settings.milvus_uri, settings.milvus_collection)
     logger.info("  重排模型 : %s (enabled=%s)", settings.reranker_model, settings.rerank_enabled)
-    logger.info("  监听地址 : http://%s:%d", settings.host, settings.port)
-    logger.info("  接口文档 : http://%s:%d/docs", settings.host, settings.port)
+    logger.info("  监听地址 : https://%s:%d", settings.host, settings.port)
+    logger.info("  接口文档 : https://%s:%d/docs", settings.host, settings.port)
     logger.info("=" * 64)
 
     uvicorn.run(

@@ -1,9 +1,9 @@
 """
 主流程（RAG-Fusion）：查询拆解 → 多路召回 → 两层 RRF 融合 → 重排 → 流式生成
 
-    api.py  →  RAG.aretrieve()  →  _generate_sub_queries()  （LLM 改写子问题）
+    api.py  →  RAG.aretrieve()  →  _generate_sub_queries()
                                 →  store.dense_search / sparse_search / fuse
-                                →  store.fuse_rankings    （跨问题融合）
+                                →  store.fuse_rankings
             →  RAG.astream()    →  llm.astream
 """
 

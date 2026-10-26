@@ -17,7 +17,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     """全局配置"""
-
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
@@ -38,26 +37,20 @@ class Settings(BaseSettings):
 
     # ---- 检索（RAG-Fusion）----
     fusion_enabled: bool = True
-    """是否启用 RAG-Fusion：先用 LLM 把原问题改写成子问题，再多路召回后融合。"""
+    """是否启用 RAG-Fusion"""
     fusion_sub_queries: int = Field(default=2, ge=0)
-    """额外生成的子问题数。原问题始终保留，总查询数 = 1 + fusion_sub_queries。"""
+    """额外生成的子问题数"""
     fusion_recall_k: int = Field(default=15, ge=1)
-    """每个问题（含原问题）召回并保留的分块数：稠密、BM25 各查 fusion_recall_k 条，
-    融合后截断到 fusion_recall_k 条参与跨问题融合。"""
+    """每个问题（含原问题）召回并保留的分块数"""
     rrf_k: int = Field(default=60, ge=1)
-    """RRF 平滑常数，两层融合（分支内、跨问题）共用。"""
+    """RRF 平滑常数"""
     bm25_analyzer_type: str = "chinese"
 
     # ---- 重排 ----
     rerank_enabled: bool = True
     reranker_model: str = "BAAI/bge-reranker-v2-m3"
     reranker_device: str = "auto"
-    """重排模型跑在哪个设备：``auto`` / ``cpu`` / ``cuda`` / ``mps``。
-
-    ``auto`` 会优先用 CUDA，其次 Apple MPS，最后回退 CPU。
-    注意：即使选了 ``cuda``，也需要装的是 **CUDA 版 torch** ——
-    纯 CPU 轮子（``x.y.z+cpu``）里 ``torch.cuda.is_available()`` 恒为 False。
-    """
+    """重排模型跑在哪个设备"""
     rerank_top_n: int = Field(default=20, ge=1)
     final_top_k: int = Field(default=5, ge=1)
     hf_home: str = ""
@@ -71,13 +64,9 @@ class Settings(BaseSettings):
 
     # ---- 生成 ----
     temperature: float = Field(default=0.2, ge=0.0, le=2.0)
-    max_context_chars: int = Field(default=10000, ge=500)
+    max_context_chars: int = Field(default=100000, ge=2000)
     show_thinking: bool = True
-    """是否把推理模型的思考过程推给前端。
-
-    思考内容**始终**会从正文里剥离（否则会混进答案），
-    这个开关只决定"剥离出来的思考要不要一起发出去给用户看"。
-    """
+    """是否把推理模型的思考过程推给前端"""
 
     # ---- 服务 ----
     host: str = "127.0.0.1"

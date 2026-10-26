@@ -50,7 +50,7 @@ async def _run(args: argparse.Namespace) -> int:
 
 
 async def _cmd_ingest(rag: RAG, args: argparse.Namespace) -> int:
-    """导入文件或目录。"""
+    """导入文件或目录"""
     target = Path(args.path)
     if not target.exists():
         print(f"[错误] 路径不存在：{target}", file=sys.stderr)
@@ -76,7 +76,7 @@ async def _cmd_ingest(rag: RAG, args: argparse.Namespace) -> int:
 
 
 async def _cmd_search(rag: RAG, args: argparse.Namespace) -> int:
-    """只跑检索，打印查询拆解与打分明细（不调用生成模型）。"""
+    """只跑检索，打印查询拆解与打分明细"""
     hits, queries = await rag.aretrieve(args.query)
 
     print(f"\n原问题：{args.query}")
@@ -127,7 +127,6 @@ def _cmd_stats(rag: RAG) -> int:
     for key, value in info.items():
         print(f"  {key.ljust(width)} : {value}")
 
-    # 降级原因要显式打印出来，不能只留在日志里
     if rag.rerank_warning:
         print(f"\n警告：{rag.rerank_warning}")
     return 0
@@ -142,9 +141,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_ingest = sub.add_parser(
-        "ingest", help="把文件或目录导入知识库（目录递归处理）"
-    )
+    p_ingest = sub.add_parser("ingest", help="把文件或目录导入知识库")
     p_ingest.add_argument("path", help="文件或目录路径")
 
     p_search = sub.add_parser("search", help="执行检索并查看打分明细")
